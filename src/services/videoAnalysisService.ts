@@ -1,5 +1,6 @@
 import * as tf from '@tensorflow/tfjs';
 import { EmotionalState } from '@/types/emotions';
+import { TensorflowService } from './tensorflowService';
 
 export class VideoAnalysisService {
   private static instance: VideoAnalysisService;
@@ -33,8 +34,9 @@ export class VideoAnalysisService {
     try {
       console.log('Initializing video analysis model...');
       
-      // Wait for TF to be ready
-      await tf.ready();
+      // Ensure TensorflowService is initialized and a backend is set
+      await TensorflowService.getInstance();
+      console.log('[VideoAnalysisService] TensorFlow.js backend should be ready via TensorflowService.');
       
       const model = tf.sequential();
 
@@ -141,67 +143,57 @@ export class VideoAnalysisService {
     }
   }
 
-  public async analyzeFrame(frameData: ImageData): Promise<EmotionalState> {
-    // Define baseline values similar to text analysis
-    const baselineValues = {
-      stress: 55,
-      clarity: 54,
-      engagement: 58
-    };
-
-    if (!this.model || !this.modelInitialized) {
-      console.log('Video analysis model not ready, using baseline values');
-      return baselineValues;
+  public async analyzeVideoFrame(frame: HTMLVideoElement): Promise<AnalysisResult> {
+    if (!this.modelInitialized) {
+      console.warn('Video analysis model not initialized');
+      return this.getDefaultResult();
     }
 
-    let input: tf.Tensor4D | null = null;
-    let prediction: tf.Tensor | null = null;
-
     try {
-      // Preprocess frame
-      input = await this.preprocessFrame(frameData);
-      
-      if (!input || input.shape.some(dim => dim <= 0)) {
-        console.warn('Invalid input tensor');
-        return baselineValues;
-      }
+      // Convert frame to tensor
+      const tensor = tf.browser.fromPixels(frame)
+        .resizeBilinear([224, 224])
+        .expandDims(0)
+        .toFloat()
+        .div(255.0);
 
-      // Make prediction
-      prediction = this.model.predict(input) as tf.Tensor;
+      // Get prediction
+      const prediction = this.model!.predict(tensor) as tf.Tensor;
       const values = await prediction.data();
 
-      if (values.length !== 3) {
-        console.warn('Invalid prediction length');
-        return baselineValues;
-      }
+      // Cleanup
+      tensor.dispose();
+      prediction.dispose();
 
-      // Check for NaN or invalid values
-      if (values.some(v => isNaN(v) || !isFinite(v) || v < 0)) {
-        console.warn('Invalid prediction values');
-        return baselineValues;
-      }
-
-      // Blend with baseline values for stability
-      const result = {
-        stress: Math.round(values[0] * 100 * 0.7 + baselineValues.stress * 0.3),
-        clarity: Math.round(values[1] * 100 * 0.7 + baselineValues.clarity * 0.3),
-        engagement: Math.round(values[2] * 100 * 0.7 + baselineValues.engagement * 0.3),
+      const state = {
+        stress: Math.round(values[0] * 100),
+        clarity: Math.round(values[1] * 100),
+        engagement: Math.round(values[2] * 100)
       };
 
-      // Ensure values are in valid range
       return {
-        stress: Math.max(0, Math.min(100, result.stress)),
-        clarity: Math.max(0, Math.min(100, result.clarity)),
-        engagement: Math.max(0, Math.min(100, result.engagement)),
+        state,
+        confidence: 0.8, // High confidence for real-time analysis
+        analysis: 'Real-time video analysis',
+        suggestions: []
       };
     } catch (error) {
       console.error('Error analyzing video frame:', error);
-      return baselineValues;
-    } finally {
-      // Cleanup tensors
-      if (input) input.dispose();
-      if (prediction) prediction.dispose();
+      return this.getDefaultResult();
     }
+  }
+
+  private getDefaultResult(): AnalysisResult {
+    return {
+      state: {
+        stress: 50,
+        clarity: 50,
+        engagement: 50
+      },
+      confidence: 0,
+      analysis: '',
+      suggestions: []
+    };
   }
 
   public async trainModel(trainingData: { frame: ImageData; emotions: EmotionalState }[]) {

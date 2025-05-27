@@ -1,42 +1,108 @@
 import { createSlice, PayloadAction } from '@reduxjs/toolkit';
+import { EmotionalState } from '@/types/emotions';
 
-export interface EmotionalState {
-  stress: number;
-  clarity: number;
-  engagement: number;
+interface EmotionalStateWithMetadata {
+  emotionalState: EmotionalState;
+  confidence: number;
+  weight: number;
 }
 
-const defaultEmotionalState: EmotionalState = {
-  stress: 50,
-  clarity: 50,
-  engagement: 50,
-};
+interface AudioState {
+  isRecording: boolean;
+  isPlaying: boolean;
+  duration: number;
+  audioLevel: number;
+  timeRemaining: number;
+  transcription: string;
+  isAnalyzing: boolean;
+  emotionalFeedback?: {
+    analysis: string;
+    suggestions: string[];
+    confidence: number;
+  };
+  currentlyPlayingId?: string;
+  isPlaybackLocked: boolean;
+  confidence: number;
+}
 
 interface CommunicationState {
   mode: 'text' | 'audio' | 'video';
-  isActive: boolean;
   emotionalStates: {
-    text: EmotionalState;
-    audio: EmotionalState;
-    video: EmotionalState;
+    text?: EmotionalStateWithMetadata;
+    audio?: EmotionalStateWithMetadata;
+    video?: EmotionalStateWithMetadata;
   };
-  history: {
+  audioState: AudioState;
+  history: Array<{
     message: string;
     emotionalState: EmotionalState;
+    timestamp?: number;
+    mode?: 'text' | 'audio' | 'video';
+    confidence?: number;
+  }>;
+  overallConfidence: number;
+  textMessages: Array<{
+    id: string;
+    text: string;
     timestamp: number;
-    mode: 'text' | 'audio' | 'video';
-  }[];
+    emotionalState: EmotionalState;
+    analysis: string;
+    suggestions: string[];
+    confidence: number;
+  }>;
 }
+
+const initialEmotionalState: EmotionalState = {
+  stress: 50,
+  clarity: 50,
+  engagement: 50
+};
+
+const initialModalityState: EmotionalStateWithMetadata = {
+  emotionalState: { ...initialEmotionalState },
+  confidence: 0.3,
+  weight: 1
+};
+
+const initialAudioState: AudioState = {
+  isRecording: false,
+  isPlaying: false,
+  duration: 0,
+  audioLevel: 0,
+  timeRemaining: 60,
+  transcription: '',
+  isAnalyzing: false,
+  isPlaybackLocked: false,
+  confidence: 30
+};
 
 const initialState: CommunicationState = {
   mode: 'text',
-  isActive: false,
-  emotionalStates: {
-    text: { ...defaultEmotionalState },
-    audio: { ...defaultEmotionalState },
-    video: { ...defaultEmotionalState },
-  },
+  emotionalStates: {},
+  audioState: { ...initialAudioState },
   history: [],
+  overallConfidence: 0.3,
+  textMessages: []
+};
+
+// Helper function to validate emotional state values
+const validateEmotionalState = (state: EmotionalState | undefined): EmotionalState => {
+  if (!state) {
+    return { ...initialEmotionalState };
+  }
+  return {
+    stress: isNaN(state.stress) ? 50 : Math.min(100, Math.max(0, state.stress)),
+    clarity: isNaN(state.clarity) ? 50 : Math.min(100, Math.max(0, state.clarity)),
+    engagement: isNaN(state.engagement) ? 50 : Math.min(100, Math.max(0, state.engagement))
+  };
+};
+
+// Helper function to check if an emotional state is active (different from default)
+const isEmotionalStateActive = (state: EmotionalState): boolean => {
+  const defaultState = initialEmotionalState;
+  return state.stress !== defaultState.stress ||
+         state.clarity !== defaultState.clarity ||
+         state.engagement !== defaultState.engagement;
 };
 
 export const communicationSlice = createSlice({
@@ -45,67 +111,93 @@ export const communicationSlice = createSlice({
   reducers: {
     setMode: (state, action: PayloadAction<'text' | 'audio' | 'video'>) => {
       state.mode = action.payload;
+      // Initialize modality state with default values
+      state.emotionalStates[action.payload] = { ...initialModalityState };
     },
-    setActive: (state, action: PayloadAction<boolean>) => {
-      state.isActive = action.payload;
-    },
-    updateEmotionalState: (state, action: PayloadAction<EmotionalState>) => {
-      // Debug log
-      console.log(`Updating emotional state for mode [${state.mode}]:`, action.payload);
+    updateEmotionalState: (state, action: PayloadAction<{
+      emotionalState: EmotionalState;
+      confidence: number;
+      weight: number;
+    }>) => {
+      const { mode } = state;
+      const { emotionalState, confidence, weight } = action.payload;
+      const currentState = state.emotionalStates[mode];
+
+      // Validate and normalize the emotional state
+      const validatedState = validateEmotionalState(emotionalState);
       
-      // Validate emotional state values
-      const validatedState = {
-        stress: !isNaN(action.payload.stress) && isFinite(action.payload.stress) 
-          ? Math.max(0, Math.min(100, action.payload.stress))
-          : defaultEmotionalState.stress,
-        clarity: !isNaN(action.payload.clarity) && isFinite(action.payload.clarity)
-          ? Math.max(0, Math.min(100, action.payload.clarity))
-          : defaultEmotionalState.clarity,
-        engagement: !isNaN(action.payload.engagement) && isFinite(action.payload.engagement)
-          ? Math.max(0, Math.min(100, action.payload.engagement))
-          : defaultEmotionalState.engagement
+      // Validate confidence (ensure it's between 0 and 1)
+      const validConfidence = confidence !== undefined ? 
+        Math.min(1, Math.max(0, isNaN(confidence) ? 0.3 : confidence)) :
+        currentState?.confidence || 0.3;
+
+      // Update the modality state
+      state.emotionalStates[mode] = {
+        emotionalState: validatedState,
+        confidence: validConfidence,
+        weight: weight || currentState?.weight || 1,
       };
 
-      // Ensure values are different from defaults to indicate actual data
-      const hasRealData = 
-        validatedState.stress !== defaultEmotionalState.stress ||
-        validatedState.clarity !== defaultEmotionalState.clarity ||
-        validatedState.engagement !== defaultEmotionalState.engagement;
-        
-      console.log(`Validated emotional state for [${state.mode}]:`, validatedState, 
-        hasRealData ? '(contains real data)' : '(using defaults)');
+      // Calculate overall confidence based on active modalities
+      const activeModalities = Object.entries(state.emotionalStates)
+        .filter(([_, modalityState]) => {
+          const isActive = isEmotionalStateActive(modalityState.emotionalState);
+          const hasConfidence = modalityState.confidence > 0;
+          return isActive && hasConfidence;
+        });
 
-      // If no real data was provided, make sure we generate some variation
-      // to avoid the values appearing stuck
-      if (!hasRealData) {
-        validatedState.stress = 45 + Math.round(Math.random() * 10);
-        validatedState.clarity = 45 + Math.round(Math.random() * 10);
-        validatedState.engagement = 45 + Math.round(Math.random() * 10);
-        console.log(`Generated random variation for empty data:`, validatedState);
+      if (activeModalities.length > 0) {
+        const totalConfidence = activeModalities.reduce(
+          (sum, [_, modalityState]) => sum + modalityState.confidence * modalityState.weight,
+          0
+        );
+        const totalWeight = activeModalities.reduce(
+          (sum, [_, modalityState]) => sum + modalityState.weight,
+          0
+        );
+        state.overallConfidence = totalWeight > 0 ? 
+          Math.min(1, Math.max(0, totalConfidence / totalWeight)) : 
+          0.3;
+      } else {
+        state.overallConfidence = 0.3; // Default confidence when no active modalities
       }
-
-      // Update the emotional state for the current mode
-      state.emotionalStates[state.mode] = validatedState;
     },
-    addToHistory: (state, action: PayloadAction<{ message: string; emotionalState: EmotionalState }>) => {
+    updateAudioState: (state, action: PayloadAction<Partial<AudioState>>) => {
+      state.audioState = { ...state.audioState, ...action.payload };
+    },
+    addToHistory: (state, action: PayloadAction<{
+      message: string;
+      emotionalState: EmotionalState;
+      confidence?: number;
+    }>) => {
       state.history.push({
         ...action.payload,
         timestamp: Date.now(),
         mode: state.mode,
+        confidence: action.payload.confidence || state.emotionalStates[state.mode]?.confidence || 0.3
       });
     },
-    resetEmotionalState: (state, action: PayloadAction<'text' | 'audio' | 'video'>) => {
-      state.emotionalStates[action.payload] = { ...defaultEmotionalState };
+    addTextMessage: (state, action: PayloadAction<{
+      id: string;
+      text: string;
+      timestamp: number;
+      emotionalState: EmotionalState;
+      analysis: string;
+      suggestions: string[];
+      confidence: number;
+    }>) => {
+      state.textMessages.push(action.payload);
     },
-  },
+    resetEmotionalStates: (state) => {
+      state.emotionalStates = {};
+      state.history = [];
+      state.overallConfidence = 0.3;
+      state.audioState = { ...initialAudioState };
+      // Don't reset text messages when resetting emotional states
+    }
+  }
 });
 
-export const {
-  setMode,
-  setActive,
-  updateEmotionalState,
-  addToHistory,
-  resetEmotionalState,
-} = communicationSlice.actions;
+export const { setMode, updateEmotionalState, updateAudioState, addToHistory, addTextMessage, resetEmotionalStates } = communicationSlice.actions;
 
 export default communicationSlice.reducer; 

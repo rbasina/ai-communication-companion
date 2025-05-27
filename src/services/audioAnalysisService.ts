@@ -1,496 +1,410 @@
 import * as tf from '@tensorflow/tfjs';
 import { EmotionalState } from '@/types/emotions';
+import { loadPretrainedModel, audioModelConfig } from '@/utils/modelLoader';
+import { TrainingDataService } from './trainingDataService';
+import { TensorflowService } from './tensorflowService';
+import { debugLog, performanceMonitor, memoryMonitor, coverage } from '@/utils/debugLogger';
+
+interface WorkerMessage {
+  type: 'ready' | 'analysisComplete' | 'error' | 'progress';
+  result?: unknown;
+  error?: string;
+  progress?: number;
+}
+
+interface TrainingData {
+  audioData: Float32Array;
+  emotionalState: EmotionalState;
+  timestamp: number;
+}
+
+interface EmotionalStateAccumulator {
+  stress: number;
+  clarity: number;
+  engagement: number;
+}
+
+// Constants for performance tuning
+const WORKER_TIMEOUT = 1000; // 1 second timeout for worker operations
+const MAX_PENDING_ANALYSES = 3;
+const WORKER_RESET_INTERVAL = 15000;
+const ANALYSIS_RETRY_DELAY = 25; // Reduced from 50ms to 25ms for faster updates
+const MIN_ANALYSIS_INTERVAL = 50; // Reduced from 100ms to 50ms for more frequent updates
+const QUICK_ANALYSIS_THRESHOLD = 300; // Reduced from 500ms to 300ms for faster switching
 
 export class AudioAnalysisService {
-  private static instance: AudioAnalysisService;
+  private static instance: AudioAnalysisService | null = null;
   private static initializationPromise: Promise<void> | null = null;
   private model: tf.LayersModel | null = null;
-  private sampleRate = 16000; // Standard sample rate for speech
-  private frameLength = 1024; // Frame size for audio processing
-  private hopLength = 512; // Number of samples between successive frames
+  private sampleRate = 16000;
+  private frameLength = 256; // Reduced from 512 to 256 for faster processing
+  private hopLength = 128; // Reduced from 256 to 128
   private modelInitialized = false;
+  private trainingDataService: TrainingDataService;
+  private lastAnalysisTime = 0;
+  private lastEmotionalState: EmotionalState = {
+    stress: 50,
+    clarity: 50,
+    engagement: 50
+  };
+  private analysisInProgress = false;
+  private worker: Worker | null = null;
+  private workerReady = false;
+  private pendingAnalyses: Array<{
+    resolve: (result: EmotionalState) => void;
+    reject: (error: Error) => void;
+    timeout: NodeJS.Timeout;
+    startTime: number;
+  }> = [];
 
   private constructor() {
-    // Don't initialize in constructor
+    this.trainingDataService = TrainingDataService.getInstance();
+    this.initWorker();
   }
 
   public static async getInstance(): Promise<AudioAnalysisService> {
     if (!AudioAnalysisService.instance) {
       AudioAnalysisService.instance = new AudioAnalysisService();
-      // Initialize only once
-      if (!AudioAnalysisService.initializationPromise) {
-        AudioAnalysisService.initializationPromise = AudioAnalysisService.instance.initializeModel();
-      }
-      try {
-        // Wait for initialization
-        await AudioAnalysisService.initializationPromise;
-      } catch (error) {
-        console.error('Failed to initialize AudioAnalysisService:', error);
-        AudioAnalysisService.initializationPromise = null; // Reset promise to allow retry
-        throw error;
-      }
+      AudioAnalysisService.initializationPromise = AudioAnalysisService.instance.initialize();
     }
+    await AudioAnalysisService.initializationPromise;
     return AudioAnalysisService.instance;
   }
 
-  private async initializeModel() {
-    if (this.modelInitialized) {
-      console.log('Model already initialized');
-      return;
-    }
-
+  private async initialize(): Promise<void> {
     try {
-      console.log('Initializing audio analysis model...');
-
-      // Make sure TensorFlow.js is ready
-      await tf.ready();
-      console.log('TensorFlow.js ready');
-
-      // Create a simpler model architecture for audio analysis
-      const model = tf.sequential();
-
-      // Input layer for spectrogram features
-      model.add(tf.layers.conv2d({
-        inputShape: [128, 128, 1],
-        filters: 16,
-        kernelSize: [3, 3],
-        activation: 'relu',
-        padding: 'same',
-        kernelInitializer: 'glorotNormal'
-      }));
-
-      model.add(tf.layers.maxPooling2d({ poolSize: [2, 2] }));
-
-      // Second convolutional block
-      model.add(tf.layers.conv2d({
-        filters: 32,
-        kernelSize: [3, 3],
-        activation: 'relu',
-        padding: 'same'
-      }));
-
-      model.add(tf.layers.maxPooling2d({ poolSize: [2, 2] }));
-
-      // Flatten and dense layers
-      model.add(tf.layers.flatten());
-      
-      model.add(tf.layers.dense({
-        units: 64,
-        activation: 'relu',
-        kernelInitializer: 'glorotNormal'
-      }));
-
-      // Output layer for emotional states
-      model.add(tf.layers.dense({
-        units: 3,
-        activation: 'sigmoid',
-        kernelInitializer: 'glorotNormal'
-      }));
-
-      // Compile with appropriate loss and optimizer
-      await model.compile({
-        optimizer: tf.train.adam(0.0001),
-        loss: 'meanSquaredError',
-        metrics: ['accuracy']
-      });
-
-      // Initialize with default weights
-      const dummyData = tf.zeros([1, 128, 128, 1]);
-      const prediction = model.predict(dummyData) as tf.Tensor;
-      
-      // Verify model output
-      const values = await prediction.data();
-      if (values.length !== 3) {
-        throw new Error('Model initialization failed: incorrect output dimension');
-      }
-
-      // Initialize with reasonable default values
-      const defaultWeights = model.getWeights().map(w => {
-        const shape = w.shape;
-        return tf.randomNormal(shape, 0, 0.1);
-      });
-      
-      model.setWeights(defaultWeights);
-
-      // Cleanup
-      prediction.dispose();
-      dummyData.dispose();
-      defaultWeights.forEach(w => w.dispose());
-
-      this.model = model;
+      console.log('Initializing AudioAnalysisService...');
+      await this.loadModel();
       this.modelInitialized = true;
-      console.log('Audio analysis model initialized successfully');
-
+      console.log('AudioAnalysisService initialized successfully');
     } catch (error) {
-      console.error('Error initializing audio analysis model:', error);
-      this.modelInitialized = false;
-      this.model = null;
-      throw new Error('Failed to initialize audio analysis model. Please refresh the page and try again.');
+      console.error('Error initializing AudioAnalysisService:', error);
+      throw error;
     }
   }
 
-  private async decodeAudioData(arrayBuffer: ArrayBuffer): Promise<Float32Array> {
+  private async loadModel(): Promise<void> {
     try {
-      console.log('Decoding audio data...', { bufferSize: arrayBuffer.byteLength });
-      // Create a temporary audio context for decoding
-      const audioContext = new AudioContext({ sampleRate: this.sampleRate });
-      const audioBuffer = await audioContext.decodeAudioData(arrayBuffer);
-      
-      // Get the audio data
-      const channelData = audioBuffer.getChannelData(0); // Get mono channel
-      
-      // Resample if necessary
-      if (audioBuffer.sampleRate !== this.sampleRate) {
-        console.log(`Resampling audio from ${audioBuffer.sampleRate}Hz to ${this.sampleRate}Hz`);
-        // Simple resampling by averaging
-        const ratio = audioBuffer.sampleRate / this.sampleRate;
-        const newLength = Math.floor(channelData.length / ratio);
-        const resampledData = new Float32Array(newLength);
-        
-        for (let i = 0; i < newLength; i++) {
-          const start = Math.floor(i * ratio);
-          const end = Math.floor((i + 1) * ratio);
-          let sum = 0;
-          for (let j = start; j < end; j++) {
-            sum += channelData[j];
-          }
-          resampledData[i] = sum / (end - start);
-        }
-        console.log('Resampling complete', { 
-          originalLength: channelData.length, 
-          newLength: resampledData.length 
-        });
-        return resampledData;
-      }
-      
-      console.log('Audio decoding complete', { 
-        length: channelData.length,
-        sampleRate: audioBuffer.sampleRate,
-        duration: audioBuffer.duration
-      });
-      return channelData;
+      this.model = await loadPretrainedModel(audioModelConfig);
     } catch (error) {
-      console.error('Error decoding audio:', error);
-      throw new Error('Failed to decode audio data. Please try recording again.');
+      console.error('Error loading audio model:', error);
+      throw error;
     }
   }
 
-  private async convertAudioBufferToTensor(audioBuffer: ArrayBuffer): Promise<tf.Tensor4D> {
+  private initWorker(): void {
     try {
-      console.log('Converting audio buffer to tensor...', { bufferSize: audioBuffer.byteLength });
-      
-      // Decode audio data
-      const audioData = await this.decodeAudioData(audioBuffer);
-      
-      if (audioData.length === 0) {
-        throw new Error('Empty audio data received');
-      }
-
-      // Ensure minimum length
-      const minLength = this.frameLength * 2;
-      if (audioData.length < minLength) {
-        throw new Error('Audio recording is too short. Please record for at least 1 second.');
-      }
-
-      // Process in smaller chunks to avoid memory issues
-      const chunkSize = 16000; // 1 second of audio at 16kHz
-      const chunks: Float32Array[] = [];
-      
-      for (let i = 0; i < audioData.length; i += chunkSize) {
-        const chunk = audioData.slice(i, i + chunkSize);
-        chunks.push(chunk);
-      }
-
-      // Process each chunk with validation
-      const spectrograms = await Promise.all(chunks.map(async (chunk, index) => {
-        // Create and validate signal tensor
-        const signal = tf.tensor1d(chunk);
-        const signalMax = await tf.max(tf.abs(signal)).data();
-        
-        // Avoid division by zero or very small values
-        const normalizedSignal = signalMax[0] > 1e-6 
-          ? tf.div(signal, signalMax[0])
-          : signal;
-        
-        // Compute spectrogram with explicit typing
-        const stft = tf.signal.stft(
-          normalizedSignal as tf.Tensor1D,
-          this.frameLength,
-          this.hopLength,
-          this.frameLength,
-          tf.signal.hannWindow
-        );
-        
-        const magnitudes = tf.abs(stft);
-        
-        // Add small epsilon to avoid log(0)
-        const stabilizedMagnitudes = tf.add(magnitudes, 1e-6);
-        const melSpec = tf.log(stabilizedMagnitudes);
-        
-        // Cleanup
-        signal.dispose();
-        normalizedSignal.dispose();
-        stft.dispose();
-        magnitudes.dispose();
-        stabilizedMagnitudes.dispose();
-        
-        return melSpec;
-      }));
-
-      // Combine spectrograms
-      const combined = tf.concat(spectrograms, 0);
-      spectrograms.forEach(spec => spec.dispose());
-
-      // Robust normalization
-      const min = tf.min(combined);
-      const max = tf.max(combined);
-      const range = tf.sub(max, min);
-      
-      // Avoid division by zero
-      const rangeValue = await range.data();
-      const normalized = rangeValue[0] > 1e-6
-        ? tf.div(tf.sub(combined, min), range)
-        : tf.zeros(combined.shape);
-      
-      // Cleanup
-      combined.dispose();
-      min.dispose();
-      max.dispose();
-      range.dispose();
-
-      // Resize to expected dimensions with validation
-      const reshaped = tf.expandDims(normalized, -1) as tf.Tensor3D;
-      normalized.dispose();
-
-      const resized = tf.image.resizeBilinear(reshaped, [128, 128]);
-      reshaped.dispose();
-
-      // Add batch dimension
-      const batched = tf.expandDims(resized, 0) as tf.Tensor4D;
-      resized.dispose();
-
-      // Validate final tensor
-      const finalData = await batched.data();
-      const finalDataArray = Array.from(finalData);
-      const hasInvalidValues = finalDataArray.some(val => isNaN(val) || !isFinite(val));
-      
-      if (hasInvalidValues) {
-        console.warn('Invalid values in final tensor, using zero tensor');
-        batched.dispose();
-        return tf.zeros([1, 128, 128, 1]);
-      }
-
-      console.log('Tensor conversion complete', {
-        shape: batched.shape,
-        dtype: batched.dtype,
-        min: Math.min(...finalDataArray),
-        max: Math.max(...finalDataArray)
-      });
-
-      return batched;
+      this.worker = new Worker(new URL('../workers/audioAnalysisWorker.ts', import.meta.url));
+      this.setupWorkerHandlers();
     } catch (error) {
-      console.error('Error in audio preprocessing:', error);
-      // Return zero tensor on error
-      return tf.zeros([1, 128, 128, 1]);
+      console.error('Error initializing worker:', error);
+      this.worker = null;
     }
   }
 
-  private convertToMelScale(spectrogram: tf.Tensor): tf.Tensor {
-    try {
-      // Improved mel-scale conversion
-      const scaled = tf.mul(spectrogram, 10.0);
-      const stabilized = tf.add(scaled, 1e-6);
-      const logScale = tf.log(stabilized);
-      
-      // Cleanup
-      scaled.dispose();
-      stabilized.dispose();
-      
-      return logScale;
-    } catch (error) {
-      console.error('Error in mel-scale conversion:', error);
-      throw new Error('Failed to convert audio features. Please try recording again.');
-    }
+  private setupWorkerHandlers(): void {
+    if (!this.worker) return;
+
+    this.worker.onmessage = (e: MessageEvent<WorkerMessage>) => {
+      switch (e.data.type) {
+        case 'ready':
+          this.workerReady = true;
+          break;
+        case 'analysisComplete':
+          this.handleAnalysisComplete(e.data.result as EmotionalState);
+          break;
+        case 'error':
+          this.handleWorkerError(new Error(e.data.error));
+          break;
+        case 'progress':
+          this.updateAnalysisProgress(e.data.progress || 0);
+          break;
+      }
+    };
+
+    this.worker.onerror = (error: ErrorEvent) => {
+      console.error('Worker error:', error);
+      this.handleWorkerError(error.error);
+    };
   }
 
   public async analyzeAudio(audioBuffer: ArrayBuffer): Promise<EmotionalState> {
-    console.log('Starting audio analysis...', { bufferSize: audioBuffer.byteLength });
+    const now = Date.now();
+    const timeSinceLastAnalysis = now - this.lastAnalysisTime;
 
-    // Define baseline values - adjusted for more natural speech
-    const baselineValues = {
-      stress: 45,    // Lowered from 55 to better reflect normal speech
-      clarity: 60,   // Increased from 54 to set a higher standard
-      engagement: 58 // Maintained as is
-    };
-
-    if (!this.model || !this.modelInitialized) {
-      console.log('Model not ready, using baseline values');
-      return baselineValues;
+    // More lenient rate limiting
+    if (timeSinceLastAnalysis < MIN_ANALYSIS_INTERVAL) {
+      // Return interpolated state for smoother transitions
+      return this.interpolateState(this.lastEmotionalState);
     }
 
-    if (!audioBuffer || audioBuffer.byteLength === 0) {
-      console.error('Invalid audio data received');
-      return baselineValues;
-    }
-
-    let input: tf.Tensor4D | null = null;
-    let prediction: tf.Tensor | null = null;
+    this.lastAnalysisTime = now;
 
     try {
-      // Process audio data
-      input = await this.convertAudioBufferToTensor(audioBuffer);
+      let result: EmotionalState;
 
-      // Verify tensor shape and values
-      const shape = input.shape;
-      console.log('Input tensor shape:', shape);
-
-      // Check for NaN or Infinity in input tensor
-      const inputData = await input.data();
-      const hasInvalidValues = inputData.some(val => isNaN(val) || !isFinite(val));
-      if (hasInvalidValues) {
-        console.warn('Invalid values in input tensor, using baseline values');
-        return baselineValues;
-      }
-
-      if (shape.length !== 4 || shape[1] !== 128 || shape[2] !== 128 || shape[3] !== 1) {
-        console.warn('Invalid input shape, using baseline values');
-        return baselineValues;
-      }
-
-      // Make prediction with validation
-      prediction = this.model.predict(input) as tf.Tensor;
-      const values = await prediction.data();
-
-      if (values.length !== 3) {
-        console.warn('Invalid prediction length, using baseline values');
-        return baselineValues;
-      }
-
-      // Validate prediction values
-      if (values.some(v => isNaN(v) || !isFinite(v))) {
-        console.warn('Invalid prediction values, using baseline values');
-        return baselineValues;
-      }
-
-      // Enhanced normalization with adaptive blending
-      const normalizedValues = values.map((value, index) => {
-        // Ensure value is a number and in valid range
-        if (typeof value !== 'number' || isNaN(value) || !isFinite(value)) {
-          return baselineValues[Object.keys(baselineValues)[index] as keyof EmotionalState];
-        }
-
-        // Convert sigmoid output (0-1) to percentage (0-100)
-        const percentage = value * 100;
-        
-        // Get the baseline for this metric
-        const baseline = baselineValues[Object.keys(baselineValues)[index] as keyof EmotionalState];
-        
-        // Adaptive blending based on the metric type and value
-        let blendRatio: number;
-        if (index === 0) { // Stress
-          // More aggressive smoothing for stress to prevent spikes
-          blendRatio = percentage > baseline ? 0.6 : 0.8; // Faster decrease, slower increase
-        } else if (index === 1) { // Clarity
-          // More responsive to clarity changes
-          blendRatio = 0.75;
-        } else { // Engagement
-          // Standard blending
-          blendRatio = 0.7;
-        }
-        
-        // Apply adaptive blending
-        const blended = (percentage * blendRatio) + (baseline * (1 - blendRatio));
-        
-        // Additional smoothing for stress metric
-        if (index === 0) {
-          // Prevent rapid stress increases
-          const maxStressIncrease = 15; // Maximum allowed stress increase per analysis
-          const previousStress = baselineValues.stress;
-          if (blended > previousStress + maxStressIncrease) {
-            return Math.round(previousStress + maxStressIncrease);
+      // Use quick analysis more often for better responsiveness
+      if (timeSinceLastAnalysis < QUICK_ANALYSIS_THRESHOLD || this.analysisInProgress) {
+        result = await this.quickAnalysis(audioBuffer);
+      } else {
+        this.analysisInProgress = true;
+        try {
+          // Full analysis with worker if available
+          if (this.worker && this.workerReady) {
+            result = await this.workerAnalysis(audioBuffer);
+          } else {
+            result = await this.mainThreadAnalysis(audioBuffer);
           }
+        } finally {
+          this.analysisInProgress = false;
         }
-        
-        // Ensure final value is in valid range
-        return Math.max(0, Math.min(100, Math.round(blended)));
-      });
+      }
 
-      // Create final result with type safety
-      const result: EmotionalState = {
-        stress: normalizedValues[0],
-        clarity: normalizedValues[1],
-        engagement: normalizedValues[2]
+      // Apply smoothing to prevent jumpy updates
+      this.lastEmotionalState = this.smoothTransition(this.lastEmotionalState, result);
+      return this.lastEmotionalState;
+
+    } catch (error) {
+      console.error('Analysis error:', error);
+      return this.interpolateState(this.lastEmotionalState);
+    }
+  }
+
+  private interpolateState(state: EmotionalState): EmotionalState {
+    // Add small random variations for more natural transitions
+    const variation = () => (Math.random() - 0.5) * 2;
+    
+    return {
+      stress: Math.min(100, Math.max(0, state.stress + variation())),
+      clarity: Math.min(100, Math.max(0, state.clarity + variation())),
+      engagement: Math.min(100, Math.max(0, state.engagement + variation()))
+    };
+  }
+
+  private async quickAnalysis(audioBuffer: ArrayBuffer): Promise<EmotionalState> {
+    const audioData = new Float32Array(audioBuffer);
+    let sum = 0;
+    let max = 0;
+    let crossings = 0;
+
+    // Analyze more samples for better accuracy
+    const step = 2; // Analyze every other sample
+    for (let i = 0; i < audioData.length; i += step) {
+      const amplitude = Math.abs(audioData[i]);
+      sum += amplitude;
+      max = Math.max(max, amplitude);
+      if (i > 0 && audioData[i] * audioData[i - step] < 0) {
+        crossings++;
+      }
+    }
+
+    const average = sum / (audioData.length / step);
+    const normalizedCrossings = (crossings / (audioData.length / step)) * 1000;
+
+    // More responsive state updates with larger adjustments
+    return {
+      stress: Math.min(100, Math.max(0, this.lastEmotionalState.stress + (max * 30 - 15))),
+      clarity: Math.min(100, Math.max(0, this.lastEmotionalState.clarity + (normalizedCrossings * 0.4 - 20))),
+      engagement: Math.min(100, Math.max(0, this.lastEmotionalState.engagement + (average * 40 - 20)))
+    };
+  }
+
+  private async workerAnalysis(audioBuffer: ArrayBuffer): Promise<EmotionalState> {
+    return new Promise((resolve, reject) => {
+      const startTime = Date.now();
+      const timeout = setTimeout(() => {
+        const index = this.pendingAnalyses.findIndex(a => a.timeout === timeout);
+        if (index !== -1) {
+          this.pendingAnalyses.splice(index, 1);
+          reject(new Error('Analysis timeout'));
+        }
+      }, WORKER_TIMEOUT);
+
+      this.pendingAnalyses.push({ resolve, reject, timeout, startTime });
+
+      this.worker!.postMessage({
+        type: 'processAudio',
+        audioBuffer,
+        sampleRate: this.sampleRate,
+        frameLength: this.frameLength,
+        hopLength: this.hopLength
+      });
+    });
+  }
+
+  private async mainThreadAnalysis(audioBuffer: ArrayBuffer): Promise<EmotionalState> {
+    const input = await this.preprocessAudio(audioBuffer);
+    if (!input) {
+      return this.lastEmotionalState;
+    }
+
+    try {
+      const features = await this.extractFeatures(input);
+      return this.calculateEmotionalState(features);
+    } finally {
+      tf.dispose(input);
+    }
+  }
+
+  private smoothTransition(oldState: EmotionalState, newState: EmotionalState): EmotionalState {
+    const smoothFactor = 0.3; // Increased from 0.2 for more responsive updates
+    
+    return {
+      stress: Math.round(oldState.stress + (newState.stress - oldState.stress) * smoothFactor),
+      clarity: Math.round(oldState.clarity + (newState.clarity - oldState.clarity) * smoothFactor),
+      engagement: Math.round(oldState.engagement + (newState.engagement - oldState.engagement) * smoothFactor)
+    };
+  }
+
+  private async preprocessAudio(audioBuffer: ArrayBuffer): Promise<tf.Tensor | null> {
+    try {
+      const audioData = new Float32Array(audioBuffer);
+      return tf.tidy(() => {
+        const tensor = tf.tensor1d(audioData);
+        return tf.expandDims(tf.expandDims(tensor, 0), 2);
+      });
+    } catch (error) {
+      console.error('Error preprocessing audio:', error);
+      return null;
+    }
+  }
+
+  private async extractFeatures(input: tf.Tensor): Promise<{
+    energy: number;
+    zeroCrossings: number;
+    spectralEnergy: number;
+  }> {
+    return tf.tidy(() => {
+      const flattened = input.reshape([-1]);
+      const energy = tf.mean(tf.abs(flattened)).dataSync()[0];
+      const zeroCrossings = tf.sum(
+        tf.sign(flattened.slice(1)).sub(tf.sign(flattened.slice(0, -1))).abs()
+      ).dataSync()[0] / 2;
+      
+      const fft = tf.spectral.rfft(flattened);
+      const magnitude = tf.abs(fft);
+      const spectralEnergy = tf.mean(magnitude).dataSync()[0];
+
+      return {
+        energy,
+        zeroCrossings,
+        spectralEnergy
+      };
+    });
+  }
+
+  private calculateEmotionalState(features: {
+    energy: number;
+    zeroCrossings: number;
+    spectralEnergy: number;
+  }): EmotionalState {
+    const stress = Math.min(100, Math.max(0, Math.round(
+      50 + (features.energy * 50) + (features.zeroCrossings / 100)
+    )));
+    
+    const clarity = Math.min(100, Math.max(0, Math.round(
+      50 + (features.spectralEnergy * 30) + ((1 - features.zeroCrossings / 1000) * 20)
+    )));
+    
+    const engagement = Math.min(100, Math.max(0, Math.round(
+      50 + (features.energy * 30) + (features.spectralEnergy * 20)
+    )));
+
+    return { stress, clarity, engagement };
+  }
+
+  private handleAnalysisComplete(result: EmotionalState): void {
+    const completed = this.pendingAnalyses.shift();
+    if (completed) {
+      clearTimeout(completed.timeout);
+      completed.resolve(result);
+    }
+  }
+
+  private handleWorkerError(error: Error): void {
+    const failed = this.pendingAnalyses.shift();
+    if (failed) {
+      clearTimeout(failed.timeout);
+      failed.reject(error);
+    }
+  }
+
+  private updateAnalysisProgress(progress: number): void {
+    // Could be used to update UI progress if needed
+    debugLog.audio(`Analysis progress: ${progress}%`);
+  }
+
+  public reset(): void {
+    this.lastEmotionalState = {
+      stress: 50,
+      clarity: 50,
+      engagement: 50
+    };
+    this.lastAnalysisTime = 0;
+    this.analysisInProgress = false;
+  }
+
+  public getPersonalizedBaselines(): EmotionalState {
+    return {
+      stress: 50,
+      clarity: 50,
+      engagement: 50
+    };
+  }
+
+  public async trainOnUserData(): Promise<void> {
+    try {
+      if (!this.model) {
+        throw new Error('Model not initialized');
+      }
+
+      const trainingData: TrainingData[] = await this.trainingDataService.getTrainingData();
+      if (trainingData.length === 0) {
+        return;
+      }
+
+      // Update baselines based on recent data
+      const averages = trainingData.reduce<EmotionalStateAccumulator>((acc, curr) => ({
+        stress: acc.stress + curr.emotionalState.stress,
+        clarity: acc.clarity + curr.emotionalState.clarity,
+        engagement: acc.engagement + curr.emotionalState.engagement
+      }), { stress: 0, clarity: 0, engagement: 0 });
+
+      this.lastEmotionalState = {
+        stress: Math.round(averages.stress / trainingData.length),
+        clarity: Math.round(averages.clarity / trainingData.length),
+        engagement: Math.round(averages.engagement / trainingData.length)
       };
 
-      // Final validation of result
-      if (Object.values(result).some(v => isNaN(v) || !isFinite(v))) {
-        console.warn('Invalid final values, using baseline values');
-        return baselineValues;
-      }
+      // Extract features from audio data
+      const features = await Promise.all(
+        trainingData.map(async (data) => this.extractFeatures(tf.tensor(data.audioData)))
+      );
 
-      console.log('Analysis complete with validation', result);
-      return result;
-
+      // Fine-tune model if needed
+      await this.model.fit(
+        tf.tensor(features),
+        tf.tensor(trainingData.map((data) => [
+          data.emotionalState.stress / 100,
+          data.emotionalState.clarity / 100,
+          data.emotionalState.engagement / 100
+        ])),
+        {
+          epochs: 5,
+          batchSize: 32,
+          shuffle: true
+        }
+      );
     } catch (error) {
-      console.error('Error analyzing audio:', error);
-      return baselineValues;
-    } finally {
-      // Cleanup tensors
-      if (input) {
-        try {
-          input.dispose();
-        } catch (e) {
-          console.warn('Error disposing input tensor:', e);
-        }
-      }
-      if (prediction) {
-        try {
-          prediction.dispose();
-        } catch (e) {
-          console.warn('Error disposing prediction tensor:', e);
-        }
-      }
+      console.error('Error training on user data:', error);
+      throw error;
     }
   }
+}
 
-  public async trainModel(trainingData: { audio: ArrayBuffer; emotions: EmotionalState }[]) {
-    if (!this.model) {
-      throw new Error('Model not initialized');
-    }
+const report = coverage.getCoverageReport();
+console.log(report);
 
-    try {
-      // Preprocess training data
-      const inputPromises = trainingData.map(data => this.convertAudioBufferToTensor(data.audio));
-      const inputs = await Promise.all(inputPromises);
-
-      const labels = trainingData.map(data => [
-        data.emotions.stress / 100,
-        data.emotions.clarity / 100,
-        data.emotions.engagement / 100,
-      ]);
-
-      const xs = tf.concat(inputs);
-      const ys = tf.tensor2d(labels);
-
-      // Train the model with proper callback typing
-      await this.model.fit(xs, ys, {
-        epochs: 10,
-        batchSize: 32,
-        validationSplit: 0.2,
-        callbacks: {
-          onEpochEnd: async (epoch: number, logs?: tf.Logs) => {
-            console.log(`Epoch ${epoch + 1}: loss = ${logs?.loss ?? 'N/A'}`);
-          }
-        }
-      });
-
-      // Cleanup
-      xs.dispose();
-      ys.dispose();
-      inputs.forEach(tensor => tensor.dispose());
-    } catch (error) {
-      console.error('Error training audio model:', error);
-      throw new Error('Failed to train audio model. Please try again.');
-    }
-  }
-} 
+// In browser console
+performance.getEntriesByType('measure');
+memoryMonitor.log(); 

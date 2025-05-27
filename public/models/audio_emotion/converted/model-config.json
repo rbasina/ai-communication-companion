@@ -1,0 +1,79 @@
+{
+  "inputShape": [
+    128,
+    128,
+    1
+  ],
+  "outputShape": [
+    3
+  ],
+  "metrics": [
+    "stress",
+    "clarity",
+    "engagement"
+  ],
+  "version": "1.0.0",
+  "architecture": {
+    "type": "CNN",
+    "layers": [
+      {
+        "type": "conv2d",
+        "filters": 32,
+        "kernelSize": [
+          3,
+          3
+        ]
+      },
+      {
+        "type": "maxPooling2d",
+        "poolSize": [
+          2,
+          2
+        ]
+      },
+      {
+        "type": "conv2d",
+        "filters": 64,
+        "kernelSize": [
+          3,
+          3
+        ]
+      },
+      {
+        "type": "maxPooling2d",
+        "poolSize": [
+          2,
+          2
+        ]
+      },
+      {
+        "type": "conv2d",
+        "filters": 128,
+        "kernelSize": [
+          3,
+          3
+        ]
+      },
+      {
+        "type": "maxPooling2d",
+        "poolSize": [
+          2,
+          2
+        ]
+      },
+      {
+        "type": "dense",
+        "units": 512
+      },
+      {
+        "type": "dense",
+        "units": 3
+      }
+    ]
+  },
+  "baselineValues": {
+    "stress": 45,
+    "clarity": 60,
+    "engagement": 58
+  }
+}

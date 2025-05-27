@@ -1,6 +1,12 @@
 import * as tf from '@tensorflow/tfjs';
 import { EmotionalState } from '@/types/emotions';
 
+export interface AudioFeatures {
+  spectralFeatures: Float32Array;
+  temporalFeatures: Float32Array;
+  mfccFeatures: Float32Array;
+}
+
 export class TensorflowService {
   private static instance: TensorflowService;
   private static initializationPromise: Promise<void> | null = null;
@@ -31,16 +37,48 @@ export class TensorflowService {
       return;
     }
 
+    console.log('Initializing TensorflowService...');
+    let backendSetAndReady = false;
+
+    // Try WebGL first
     try {
-      console.log('Initializing TensorflowService...');
-      await tf.ready();
-      this.initialized = true;
-      console.log('TensorflowService initialized successfully');
-      this.initializeModel();
-    } catch (error) {
-      console.error('Error initializing TensorflowService:', error);
-      throw error;
+      console.log('Attempting to set TensorFlow.js backend to WebGL and check readiness...');
+      await tf.setBackend('webgl');
+      await tf.ready(); // Test if WebGL is truly ready
+      console.log('TensorFlow.js backend successfully set to WebGL and ready.');
+      backendSetAndReady = true;
+    } catch (webglError) {
+      console.warn('WebGL backend initialization failed. Clearing WebGL state and falling back to CPU...', webglError);
+      // It's good practice to dispose variables if a backend setup fails partially,
+      // though tf.setBackend should ideally handle cleanup.
+      // For safety, ensure no lingering WebGL state if possible, though tf.disposeVariables() clears global state.
+      // Simply proceeding to set CPU backend is usually sufficient as setBackend switches context.
     }
+
+    // If WebGL failed, try CPU
+    if (!backendSetAndReady) {
+      try {
+        console.log('Attempting to set TensorFlow.js backend to CPU and check readiness...');
+        await tf.setBackend('cpu');
+        await tf.ready(); // Test if CPU is ready
+        console.log('TensorFlow.js backend successfully set to CPU and ready.');
+        backendSetAndReady = true;
+      } catch (cpuError) {
+        console.error('CPU backend initialization failed after WebGL attempt also failed:', cpuError);
+        throw new Error('Could not initialize any TensorFlow.js backend (WebGL and CPU failed).');
+      }
+    }
+    
+    if (!backendSetAndReady) {
+        // This case should ideally not be reached if the logic above is sound and one backend succeeds.
+        console.error('Critical error: TensorFlow.js backend could not be set and confirmed ready.');
+        throw new Error('TensorFlow.js backend could not be set and confirmed ready.');
+    }
+
+    console.log(`TensorFlow.js active and ready with backend: ${tf.getBackend()}`);
+    this.initialized = true;
+    console.log('TensorflowService core initialized successfully, proceeding to initialize model.');
+    this.initializeModel(); // This should only be called if a backend is successfully initialized and ready
   }
 
   private async initializeModel() {
@@ -267,5 +305,164 @@ export class TensorflowService {
       console.error('Error training model:', error);
       throw error;
     }
+  }
+
+  public async extractAudioFeatures(buffer: ArrayBuffer): Promise<AudioFeatures> {
+    // Convert audio buffer to tensor
+    const audioData = new Float32Array(buffer);
+    const audioTensor = tf.tensor1d(audioData);
+
+    // Extract features
+    const spectralFeatures = await this.extractSpectralFeatures(audioTensor);
+    const temporalFeatures = await this.extractTemporalFeatures(audioTensor);
+    const mfccFeatures = await this.extractMFCCFeatures(audioTensor);
+
+    // Cleanup
+    audioTensor.dispose();
+
+    return {
+      spectralFeatures,
+      temporalFeatures,
+      mfccFeatures
+    };
+  }
+
+  private async extractSpectralFeatures(audioTensor: tf.Tensor1D): Promise<Float32Array> {
+    // Implement spectral feature extraction
+    return new Float32Array(128);
+  }
+
+  private async extractTemporalFeatures(audioTensor: tf.Tensor1D): Promise<Float32Array> {
+    // Implement temporal feature extraction
+    return new Float32Array(128);
+  }
+
+  private async extractMFCCFeatures(audioTensor: tf.Tensor1D): Promise<Float32Array> {
+    // Implement MFCC feature extraction
+    return new Float32Array(128);
+  }
+
+  // Add audio analysis method
+  public async analyzeAudio(audioBuffer: ArrayBuffer): Promise<EmotionalState> {
+    try {
+      // Convert ArrayBuffer to Float32Array for analysis
+      const audioData = new Float32Array(audioBuffer);
+      
+      // Extract audio features
+      const features = await tf.tidy(() => {
+        const tensor = tf.tensor1d(audioData);
+        
+        // Calculate energy
+        const energy = tf.mean(tf.abs(tensor)).dataSync()[0];
+        
+        // Calculate zero crossings
+        const zeroCrossings = tf.sum(
+          tf.sign(tensor.slice(1)).sub(tf.sign(tensor.slice(0, -1))).abs()
+        ).dataSync()[0] / 2;
+        
+        // Calculate spectral features
+        const fft = tf.spectral.rfft(tensor);
+        const magnitude = tf.abs(fft);
+        const spectralEnergy = tf.mean(magnitude).dataSync()[0];
+        
+        return {
+          energy,
+          zeroCrossings,
+          spectralEnergy
+        };
+      });
+      
+      // Convert features to emotional state
+      const stress = Math.min(100, Math.max(0, Math.round(
+        50 + // Base level
+        (features.energy * 50) + // Higher energy = more stress
+        (features.zeroCrossings / 100) // More zero crossings = more stress
+      )));
+      
+      const clarity = Math.min(100, Math.max(0, Math.round(
+        50 + // Base level
+        (features.spectralEnergy * 30) + // Better spectral energy = more clarity
+        ((1 - features.zeroCrossings / 1000) * 20) // Fewer zero crossings = more clarity
+      )));
+      
+      const engagement = Math.min(100, Math.max(0, Math.round(
+        50 + // Base level
+        (features.energy * 30) + // Higher energy = more engagement
+        (features.spectralEnergy * 20) // Better spectral energy = more engagement
+      )));
+      
+      return {
+        stress,
+        clarity,
+        engagement
+      };
+    } catch (error) {
+      console.error('Error analyzing audio:', error);
+      // Return baseline values if analysis fails
+      return {
+        stress: 50,
+        clarity: 50,
+        engagement: 50
+      };
+    }
+  }
+
+  public async analyze(input: any, type: 'text' | 'audio' | 'video'): Promise<EmotionalState | null> {
+    if (!this.initialized) {
+      console.warn('TensorflowService not initialized');
+      return null;
+    }
+
+    try {
+      switch (type) {
+        case 'text':
+          return await this.analyzeText(input);
+        case 'audio':
+          return await this.analyzeAudio(input);
+        case 'video':
+          return await this.analyzeVideo(input);
+        default:
+          throw new Error(`Unsupported analysis type: ${type}`);
+      }
+    } catch (error) {
+      console.error(`Error in TensorFlow analysis for ${type}:`, error);
+      return null;
+    }
+  }
+
+  private async analyzeVideo(frame: ImageData | HTMLVideoElement): Promise<EmotionalState> {
+    try {
+      // Convert frame to tensor
+      const tensor = tf.browser.fromPixels(frame)
+        .resizeBilinear([224, 224])
+        .expandDims(0)
+        .toFloat()
+        .div(255.0);
+
+      // Get prediction
+      const prediction = this.model!.predict(tensor) as tf.Tensor;
+      const values = await prediction.data();
+
+      // Cleanup
+      tensor.dispose();
+      prediction.dispose();
+
+      return {
+        stress: Math.round(values[0] * 100),
+        clarity: Math.round(values[1] * 100),
+        engagement: Math.round(values[2] * 100)
+      };
+    } catch (error) {
+      console.error('Error analyzing video frame:', error);
+      return this.getDefaultState();
+    }
+  }
+
+  private getDefaultState(): EmotionalState {
+    return {
+      stress: 50,
+      clarity: 50,
+      engagement: 50
+    };
   }
 } 

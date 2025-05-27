@@ -21,6 +21,14 @@ const models = [
   // Face Expression
   'face_expression_model-weights_manifest.json',
   'face_expression_model-shard1',
+  
+  // Face Landmark
+  'face_landmark_68_model-weights_manifest.json',
+  'face_landmark_68_model-shard1',
+  
+  // Face Recognition
+  'face_recognition_model-weights_manifest.json',
+  'face_recognition_model-shard1'
 ];
 
 // Function to download a file
@@ -58,16 +66,15 @@ const downloadFile = (fileName) => {
 };
 
 // Download all models
-const downloadAllModels = async () => {
+async function downloadModels() {
   try {
-    for (const model of models) {
-      await downloadFile(model);
-    }
+    console.log('Starting model downloads...');
+    await Promise.all(models.map(model => downloadFile(model)));
     console.log('All models downloaded successfully!');
   } catch (error) {
     console.error('Error downloading models:', error);
     process.exit(1);
   }
-};
+}
 
-downloadAllModels(); 
+downloadModels(); 

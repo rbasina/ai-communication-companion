@@ -1,0 +1,23 @@
+/* src/app/globals.css */
+
+html, body {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+  font-family: inherit;
+  background: #111827;
+  color: #fff;
+}
+
+*, *::before, *::after {
+  box-sizing: inherit;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  background: #222;
+}
+::-webkit-scrollbar-thumb {
+  background: #444;
+  border-radius: 4px;
+} 

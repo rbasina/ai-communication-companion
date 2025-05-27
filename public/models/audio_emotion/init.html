@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Initialize Audio Emotion Model</title>
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest"></script>
+    <script src="model-init.js"></script>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            margin: 20px;
+            line-height: 1.6;
+        }
+        #status {
+            margin: 20px 0;
+            padding: 10px;
+            border-radius: 4px;
+        }
+        .success {
+            background-color: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .error {
+            background-color: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+    </style>
+</head>
+<body>
+    <h1>Audio Emotion Model Initialization</h1>
+    <div id="status"></div>
+    <button onclick="initAndSaveModel()" id="initButton">Initialize Model</button>
+
+    <script>
+        async function initAndSaveModel() {
+            const statusDiv = document.getElementById('status');
+            const initButton = document.getElementById('initButton');
+            
+            try {
+                initButton.disabled = true;
+                statusDiv.innerHTML = 'Initializing model...';
+                statusDiv.className = '';
+
+                // Initialize the model
+                const model = await initializeModel();
+                
+                // Save the model
+                statusDiv.innerHTML = 'Saving model...';
+                await model.save('downloads://audio_emotion_model');
+                
+                // Save the configuration
+                const configBlob = new Blob(
+                    [JSON.stringify(modelConfig, null, 2)],
+                    { type: 'application/json' }
+                );
+                const configUrl = URL.createObjectURL(configBlob);
+                const configLink = document.createElement('a');
+                configLink.href = configUrl;
+                configLink.download = 'model-config.json';
+                configLink.click();
+
+                statusDiv.innerHTML = 'Model initialized and saved successfully! Please move the downloaded files to the public/models/audio_emotion/converted directory.';
+                statusDiv.className = 'success';
+                
+                // Cleanup
+                model.dispose();
+                
+            } catch (error) {
+                console.error('Error initializing model:', error);
+                statusDiv.innerHTML = 'Error initializing model: ' + error.message;
+                statusDiv.className = 'error';
+                initButton.disabled = false;
+            }
+        }
+    </script>
+</body>
+</html> 

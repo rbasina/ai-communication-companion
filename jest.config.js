@@ -1,21 +1,30 @@
-const nextJest = require('next/jest')
-
-const createJestConfig = nextJest({
-  // Provide the path to your Next.js app to load next.config.js and .env files in your test environment
-  dir: './',
-})
-
-// Add any custom config to be passed to Jest
-const customJestConfig = {
-  setupFilesAfterEnv: ['<rootDir>/jest.setup.js'],
-  testEnvironment: 'jest-environment-jsdom',
+/** @type {import('jest').Config} */
+module.exports = {
+  preset: 'ts-jest',
+  testEnvironment: 'jsdom',
   moduleNameMapper: {
-    '^@/(.*)$': '<rootDir>/src/$1',
+    '^@/(.*)$': '<rootDir>/src/$1'
   },
+  setupFilesAfterEnv: ['<rootDir>/src/tests/setup.ts'],
   testMatch: [
-    "**/__tests__/**/*.test.[jt]s?(x)",
+    '**/__tests__/**/*.test.[jt]s?(x)',
+    '**/?(*.)+(spec|test).[jt]s?(x)'
   ],
-}
-
-// createJestConfig is exported this way to ensure that next/jest can load the Next.js config which is async
-module.exports = createJestConfig(customJestConfig) 
+  transform: {
+    '^.+\\.(ts|tsx)$': ['ts-jest', {
+      tsconfig: 'tsconfig.test.json',
+      useESM: true
+    }]
+  },
+  moduleFileExtensions: ['ts', 'tsx', 'js', 'jsx', 'json', 'node'],
+  globals: {
+    'ts-jest': {
+      tsconfig: 'tsconfig.test.json',
+      useESM: true
+    }
+  },
+  transformIgnorePatterns: [
+    'node_modules/(?!(module-that-needs-transform)/)'
+  ],
+  extensionsToTreatAsEsm: ['.ts', '.tsx']
+}; 

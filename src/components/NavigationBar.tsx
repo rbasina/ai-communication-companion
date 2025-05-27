@@ -1,74 +1,64 @@
-import { useDispatch, useSelector } from 'react-redux';
-import { RootState } from '@/store';
-import { setMode, setActive } from '@/store/slices/communicationSlice';
-import Link from 'next/link';
+'use client';
 
-export default function NavigationBar() {
-  const dispatch = useDispatch();
-  const { mode } = useSelector((state: RootState) => state.communication);
+import React, { useState } from 'react';
+import Settings from './Settings';
+import SettingsButton from './SettingsButton';
 
-  const handleModeChange = (newMode: 'text' | 'audio' | 'video') => {
-    console.log('NavigationBar: Changing mode to', newMode);
-    // First set mode, then ensure it's active (in case it wasn't)
-    dispatch(setMode(newMode));
-    dispatch(setActive(true));
-  };
+interface NavigationBarProps {
+  mode: 'text' | 'audio' | 'video';
+  onModeChange: (mode: 'text' | 'audio' | 'video') => void;
+}
+
+const NavigationBar: React.FC<NavigationBarProps> = ({ mode, onModeChange }) => {
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
 
   return (
-    <div className="bg-white shadow-sm mb-6">
-      <div className="container mx-auto px-4">
-        <div className="flex justify-between items-center h-16">
-          <Link href="/" className="text-xl font-semibold text-gray-900 hover:text-blue-600">
-            AI Communication Companion
-          </Link>
-          
-          <div className="flex items-center">
-            <div className="flex space-x-2 mr-4">
-              <button
-                onClick={() => handleModeChange('text')}
-                className={`px-4 py-2 rounded-lg transition-colors ${
-                  mode === 'text'
-                    ? 'bg-blue-600 text-white'
-                    : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                }`}
-              >
-                Text Chat
-              </button>
-              <button
-                onClick={() => handleModeChange('audio')}
-                className={`px-4 py-2 rounded-lg transition-colors ${
-                  mode === 'audio'
-                    ? 'bg-blue-600 text-white'
-                    : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                }`}
-              >
-                Audio Chat
-              </button>
-              <button
-                onClick={() => handleModeChange('video')}
-                className={`px-4 py-2 rounded-lg transition-colors ${
-                  mode === 'video'
-                    ? 'bg-blue-600 text-white'
-                    : 'bg-gray-100 text-gray-700 hover:bg-gray-200'
-                }`}
-              >
-                Video Chat
-              </button>
-            </div>
-            
-            <Link 
-              href="/settings" 
-              className="text-gray-600 hover:text-blue-600"
-              title="Settings"
-            >
-              <svg xmlns="http://www.w3.org/2000/svg" className="h-6 w-6" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.065 2.572c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.572 1.065c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.065-2.572c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-              </svg>
-            </Link>
-          </div>
+    <>
+      <nav className="space-y-2">
+        <button
+          className={`w-full flex items-center space-x-2 px-4 py-2 rounded-lg transition-all duration-200 ${
+            mode === 'text' ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+          }`}
+          onClick={() => onModeChange('text')}
+        >
+          <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z" />
+          </svg>
+          <span>Text Chat</span>
+        </button>
+
+        <button
+          className={`w-full flex items-center space-x-2 px-4 py-2 rounded-lg transition-all duration-200 ${
+            mode === 'audio' ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+          }`}
+          onClick={() => onModeChange('audio')}
+        >
+          <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11a7 7 0 01-7 7m0 0a7 7 0 01-7-7m7 7v4m0 0H8m4 0h4m-4-8a3 3 0 01-3-3V5a3 3 0 116 0v6a3 3 0 01-3 3z" />
+          </svg>
+          <span>Audio Chat</span>
+        </button>
+
+        <button
+          className={`w-full flex items-center space-x-2 px-4 py-2 rounded-lg transition-all duration-200 ${
+            mode === 'video' ? 'bg-blue-600 text-white' : 'bg-gray-700 text-gray-300 hover:bg-gray-600'
+          }`}
+          onClick={() => onModeChange('video')}
+        >
+          <svg className="w-6 h-6" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 10l4.553-2.276A1 1 0 0121 8.618v6.764a1 1 0 01-1.447.894L15 14M5 18h8a2 2 0 002-2V8a2 2 0 00-2-2H5a2 2 0 00-2 2v8a2 2 0 002 2z" />
+          </svg>
+          <span>Video Chat</span>
+        </button>
+
+        <div className="mt-4 flex justify-center">
+          <SettingsButton onClick={() => setIsSettingsOpen(true)} />
         </div>
-      </div>
-    </div>
+      </nav>
+
+      <Settings isOpen={isSettingsOpen} onClose={() => setIsSettingsOpen(false)} />
+    </>
   );
-} 
+};
+
+export default NavigationBar; 

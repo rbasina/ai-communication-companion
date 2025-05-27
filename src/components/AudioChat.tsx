@@ -1,18 +1,33 @@
-import { useState, useRef, useEffect } from 'react';
+'use client';
+
+import { useState, useRef, useEffect, useCallback } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
 import { RootState } from '@/store';
-import { updateEmotionalState, addToHistory, EmotionalState, setMode } from '@/store/slices/communicationSlice';
-import { EmotionAnalysisService } from '@/services/emotionAnalysis';
+import { updateEmotionalState, addToHistory, setMode, resetEmotionalStates } from '@/store/slices/communicationSlice';
+import { EmotionAnalysisService, IEmotionAnalysisService } from '@/services/emotionAnalysis';
+import { EmotionalState } from '@/types/emotions';
+import { TrainingDataService } from '@/services/trainingDataService';
+import { createPortal } from 'react-dom';
+import { debounce } from 'lodash';
+import { debugLog, measurePerformance, validateEmotionalState } from '@/utils/debugUtils';
+import { TaraEmotionIndicator } from './TARA/TaraEmotionIndicator';
 
-// Extend MediaRecorder type to include durationInterval
+// Extend MediaRecorder type to include durationInterval and stream
 declare global {
   interface MediaRecorder {
+    readonly stream: MediaStream;
     durationInterval?: NodeJS.Timeout;
   }
   interface Window {
     webkitAudioContext: typeof AudioContext;
-    SpeechRecognition: typeof SpeechRecognition;
-    webkitSpeechRecognition: typeof SpeechRecognition;
+    SpeechRecognition: {
+      prototype: SpeechRecognition;
+      new(): SpeechRecognition;
+    };
+    webkitSpeechRecognition: {
+      prototype: SpeechRecognition;
+      new(): SpeechRecognition;
+    };
   }
 }
 
@@ -31,6 +46,9 @@ interface AudioState {
   transcription: string;
   isAnalyzing: boolean;
   emotionalFeedback?: EmotionalFeedback;
+  currentlyPlayingId?: string;
+  isPlaybackLocked: boolean;
+  confidence: number;
 }
 
 interface AudioMessage {
@@ -39,18 +57,38 @@ interface AudioMessage {
   duration: number;
   timestamp: number;
   emotionalState: EmotionalState;
-  valid?: boolean; // Track message validity
+  transcription?: string;
+  analysis?: EmotionalFeedback;
+  valid?: boolean;
 }
 
 // Add TypeScript definitions for Web Speech API
 interface SpeechRecognitionErrorEvent extends Event {
   error: string;
-  message?: string;
+  message: string;
 }
 
 interface SpeechRecognitionEvent extends Event {
   resultIndex: number;
   results: SpeechRecognitionResultList;
+}
+
+interface SpeechRecognitionResultList {
+  length: number;
+  item(index: number): SpeechRecognitionResult;
+  [index: number]: SpeechRecognitionResult;
+}
+
+interface SpeechRecognitionResult {
+  isFinal: boolean;
+  length: number;
+  item(index: number): SpeechRecognitionAlternative;
+  [index: number]: SpeechRecognitionAlternative;
+}
+
+interface SpeechRecognitionAlternative {
+  transcript: string;
+  confidence: number;
 }
 
 interface SpeechGrammarList {
@@ -88,249 +126,738 @@ interface SpeechRecognition extends EventTarget {
   abort(): void;
 }
 
-// Define the constructor interface
-declare var SpeechRecognition: {
-  prototype: SpeechRecognition;
-  new(): SpeechRecognition;
-};
-
-declare var webkitSpeechRecognition: {
-  prototype: SpeechRecognition;
-  new(): SpeechRecognition;
-};
-
-declare global {
-  interface Window {
-    webkitAudioContext: typeof AudioContext;
-    SpeechRecognition: typeof SpeechRecognition;
-    webkitSpeechRecognition: typeof webkitSpeechRecognition;
+// Threshold constants for emotional metrics
+const EMOTION_THRESHOLDS = {
+  stress: {
+    low: 35,
+    high: 65,
+    optimal: { min: 40, max: 55 }
+  },
+  clarity: {
+    low: 45,
+    high: 75,
+    optimal: { min: 55, max: 70 }
+  },
+  engagement: {
+    low: 40,
+    high: 70,
+    optimal: { min: 50, max: 65 }
   }
+};
+
+const getMetricIndicator = (value: number, metric: keyof typeof EMOTION_THRESHOLDS) => {
+  const thresholds = EMOTION_THRESHOLDS[metric];
+  if (value < thresholds.low) return "Too Low";
+  if (value > thresholds.high) return "Too High";
+  if (value >= thresholds.optimal.min && value <= thresholds.optimal.max) return "Good";
+  return "Moderate";
+};
+
+// Add helper functions for level descriptions
+const getStressLevel = (stress: number): string => {
+  if (stress < 30) return "Very Relaxed";
+  if (stress < 45) return "Relaxed";
+  if (stress < 55) return "Moderate";
+  if (stress < 70) return "Elevated";
+  return "High";
+};
+
+const getClarityLevel = (clarity: number): string => {
+  if (clarity < 30) return "Unclear";
+  if (clarity < 45) return "Somewhat Clear";
+  if (clarity < 65) return "Clear";
+  if (clarity < 80) return "Very Clear";
+  return "Excellent";
+};
+
+const getEngagementLevel = (engagement: number): string => {
+  if (engagement < 30) return "Low";
+  if (engagement < 45) return "Moderate";
+  if (engagement < 65) return "Good";
+  if (engagement < 80) return "High";
+  return "Excellent";
+};
+
+// Add MessageSummary component after the interface definitions
+interface MessageSummaryProps {
+  message: AudioMessage;
+  isPlaying: boolean;
 }
 
-export default function AudioChat() {
+const MessageSummary: React.FC<MessageSummaryProps> = ({ message, isPlaying }) => {
+  const { emotionalState } = message;
+  const { stress, clarity, engagement } = emotionalState;
+
+  return (
+    <div className="bg-gray-50 p-4 rounded-lg shadow-sm mt-2">
+      {/* Emotional Metrics */}
+      <div className="space-y-3">
+        <div>
+          <div className="flex justify-between mb-1">
+            <span className="text-sm">Stress</span>
+            <span className="text-sm">{stress}% - {getStressLevel(stress)}</span>
+          </div>
+          <div className="h-2 bg-gray-200 rounded-full">
+            <div
+              className="h-full bg-red-500 rounded-full transition-all duration-300"
+              style={{ width: `${stress}%` }}
+            />
+          </div>
+        </div>
+        <div>
+          <div className="flex justify-between mb-1">
+            <span className="text-sm">Clarity</span>
+            <span className="text-sm">{clarity}% - {getClarityLevel(clarity)}</span>
+          </div>
+          <div className="h-2 bg-gray-200 rounded-full">
+            <div
+              className="h-full bg-blue-500 rounded-full transition-all duration-300"
+              style={{ width: `${clarity}%` }}
+            />
+          </div>
+        </div>
+        <div>
+          <div className="flex justify-between mb-1">
+            <span className="text-sm">Engagement</span>
+            <span className="text-sm">{engagement}% - {getEngagementLevel(engagement)}</span>
+          </div>
+          <div className="h-2 bg-gray-200 rounded-full">
+            <div
+              className="h-full bg-green-500 rounded-full transition-all duration-300"
+              style={{ width: `${engagement}%` }}
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* Transcription if available */}
+      {message.transcription && (
+        <div className="mt-3">
+          <h4 className="text-sm font-medium text-gray-700 mb-1">Transcription</h4>
+          <p className="text-sm text-gray-600 italic">{message.transcription}</p>
+        </div>
+      )}
+
+      {/* Analysis and Suggestions */}
+      {message.analysis && (
+        <div className="mt-3">
+          <h4 className="text-sm font-medium text-gray-700 mb-1">Analysis</h4>
+          <p className="text-sm text-gray-600">{message.analysis.analysis}</p>
+          
+          {message.analysis.suggestions.length > 0 && (
+            <div className="mt-2">
+              <h4 className="text-sm font-semibold text-gray-700 mb-1">Suggestions</h4>
+              <ul className="list-disc list-inside text-sm text-gray-600">
+                {message.analysis.suggestions.map((suggestion, index) => (
+                  <li key={index}>{suggestion}</li>
+                ))}
+              </ul>
+            </div>
+          )}
+        </div>
+      )}
+    </div>
+  );
+};
+
+// Add type declarations at the top of the file
+interface CustomMediaRecorder extends MediaRecorder {
+  durationInterval?: NodeJS.Timeout;
+}
+
+// Constants
+const MAX_CHUNKS_STORED = 150; // Store 15 seconds max (at 100ms chunks)
+const ANALYSIS_INTERVAL = 500; // Analyze every 500ms
+const CHUNK_INTERVAL = 100; // 100ms chunks for smoother analysis
+const VISUALIZATION_UPDATE_INTERVAL = 16; // ~60fps for smooth visualization
+const generateUniqueId = () => `${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+
+// Component definition
+const AudioChat: React.FC = () => {
   const dispatch = useDispatch();
+  const { emotionalStates } = useSelector((state: RootState) => state.communication);
   const [audioState, setAudioState] = useState<AudioState>({
     isRecording: false,
     isPlaying: false,
     duration: 0,
     audioLevel: 0,
-    timeRemaining: 30,
+    timeRemaining: 60,
     transcription: '',
-    isAnalyzing: false
+    isAnalyzing: false,
+    isPlaybackLocked: false,
+    confidence: 0
   });
+
   const [messages, setMessages] = useState<AudioMessage[]>([]);
   const [error, setError] = useState<string | null>(null);
-  const [isAnalyzing, setIsAnalyzing] = useState(false);
-  const [isModelReady, setIsModelReady] = useState(false);
-  const [emotionService, setEmotionService] = useState<EmotionAnalysisService | null>(null);
+  const [emotionService, setEmotionService] = useState<IEmotionAnalysisService | null>(null);
+  const [trainingService, setTrainingService] = useState<TrainingDataService | null>(null);
+  const [showTrainingPrompt, setShowTrainingPrompt] = useState(false);
+  const [isInitializing, setIsInitializing] = useState(true);
 
-  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  // Use refs for values that don't need to trigger re-renders
+  const lastAnalysisTimeRef = useRef<number>(0);
+  const lastEmotionalStateRef = useRef<EmotionalState>({ stress: 50, clarity: 50, engagement: 50 });
+  const analysisInProgressRef = useRef<boolean>(false);
   const audioChunksRef = useRef<Blob[]>([]);
+  const mediaRecorderRef = useRef<CustomMediaRecorder | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
-  const currentAudioRef = useRef<HTMLAudioElement | null>(null);
-  const { emotionalStates } = useSelector((state: RootState) => state.communication);
-  const currentEmotionalState = emotionalStates.audio;
-  const recognitionRef = useRef<SpeechRecognition | null>(null);
+  const analyzerNodeRef = useRef<AnalyserNode | null>(null);
+  const streamRef = useRef<MediaStream | null>(null);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const animationFrameRef = useRef<number | null>(null);
+  const durationIntervalRef = useRef<NodeJS.Timeout | null>(null);
 
-  // Initialize emotion service
+  // Add state update debouncing
+  const debouncedStateUpdate = useCallback(
+    debounce((newState: Partial<AudioState>) => {
+      setAudioState(prev => ({ ...prev, ...newState }));
+    }, 50),
+    []
+  );
+
+  // Add emotional state update debouncing
+  const debouncedEmotionalStateUpdate = useCallback(
+    debounce((state: { emotionalState: EmotionalState; confidence: number; weight: number }) => {
+      dispatch(updateEmotionalState(state));
+    }, 100),
+    [dispatch]
+  );
+
+  // Add confidence ref
+  const confidenceRef = useRef<number>(30);
+  const analysisCountRef = useRef<number>(0);
+
+  // Update the useEffect that syncs emotional state
+  useEffect(() => {
+    if (audioState.isRecording && emotionalStates.audio) {
+      lastEmotionalStateRef.current = emotionalStates.audio.emotionalState;
+      
+      // Update confidence based on analysis count and duration
+      const newConfidence = Math.min(95, Math.max(30,
+        30 + // Base confidence
+        (analysisCountRef.current * 3) + // More weight on analysis count
+        (audioState.duration * 2) + // Longer duration = higher confidence
+        (audioChunksRef.current.length > 10 ? 20 : 0) // More chunks = higher confidence
+      ));
+      
+      confidenceRef.current = newConfidence;
+      
+      debouncedStateUpdate({
+        emotionalFeedback: {
+          analysis: "Real-time analysis in progress...",
+          suggestions: [
+            "Keep speaking naturally",
+            `Current stress level: ${emotionalStates.audio.emotionalState.stress}% - ${getStressLevel(emotionalStates.audio.emotionalState.stress)}`,
+            `Speech clarity: ${emotionalStates.audio.emotionalState.clarity}% - ${getClarityLevel(emotionalStates.audio.emotionalState.clarity)}`,
+            `Engagement: ${emotionalStates.audio.emotionalState.engagement}% - ${getEngagementLevel(emotionalStates.audio.emotionalState.engagement)}`
+          ],
+          confidence: newConfidence
+        }
+      });
+    }
+  }, [emotionalStates.audio, audioState.isRecording, audioState.duration]);
+
+  // Update cleanup function
+  const cleanupRecording = useCallback(async () => {
+    try {
+      // Stop visualization first
+      if (animationFrameRef.current) {
+        cancelAnimationFrame(animationFrameRef.current);
+        animationFrameRef.current = null;
+      }
+
+      // Clear intervals
+      if (durationIntervalRef.current) {
+        clearInterval(durationIntervalRef.current);
+        durationIntervalRef.current = null;
+      }
+
+      // Stop speech recognition
+      if (recognitionRef.current) {
+        try {
+          recognitionRef.current.stop();
+        } catch (error) {
+          console.error('Error stopping speech recognition:', error);
+        }
+        recognitionRef.current = null;
+      }
+
+      // Stop media recorder
+      if (mediaRecorderRef.current?.state === 'recording') {
+        mediaRecorderRef.current.stop();
+      }
+
+      // Stop all media tracks
+      if (streamRef.current) {
+        streamRef.current.getTracks().forEach(track => {
+          track.stop();
+          track.enabled = false;
+        });
+        streamRef.current = null;
+      }
+
+      // Close audio context
+      if (audioContextRef.current?.state !== 'closed') {
+        try {
+          await audioContextRef.current?.close();
+        } catch (error) {
+          console.error('Error closing audio context:', error);
+        }
+        audioContextRef.current = null;
+      }
+
+      // Reset all refs
+      mediaRecorderRef.current = null;
+      analyzerNodeRef.current = null;
+      audioChunksRef.current = [];
+
+      // Reset state
+      setAudioState(prev => ({
+        ...prev,
+        isRecording: false,
+        isPlaying: false,
+        duration: 0,
+        audioLevel: 0,
+        timeRemaining: 60,
+        transcription: '',
+        isAnalyzing: false,
+        emotionalFeedback: undefined,
+        isPlaybackLocked: false,
+        confidence: 30
+      }));
+
+    } catch (error) {
+      console.error('Error during cleanup:', error);
+    }
+  }, []);
+
+  // Add audio context state change handler
+  useEffect(() => {
+    const handleAudioContextStateChange = () => {
+      if (audioContextRef.current?.state === 'suspended') {
+        audioContextRef.current.resume().catch(error => {
+          console.error('Error resuming audio context:', error);
+        });
+      }
+    };
+
+    if (audioContextRef.current) {
+      audioContextRef.current.onstatechange = handleAudioContextStateChange;
+    }
+
+    return () => {
+      if (audioContextRef.current) {
+        audioContextRef.current.onstatechange = null;
+      }
+    };
+  }, []);
+
+  // Update the setupMediaRecorder function
+  const setupMediaRecorder = useCallback((recorder: MediaRecorder) => {
+    let chunks: Blob[] = [];
+    let isProcessing = false;
+    let lastProcessedTime = Date.now();
+    let queueSize = 0;
+    const MAX_QUEUE_SIZE = 3; // Reduced for faster processing
+    const MIN_CHUNK_SIZE = 256; // Reduced minimum chunk size for faster analysis
+    const ANALYSIS_INTERVAL = 50; // Analyze every 50ms for more frequent updates
+    
+    recorder.ondataavailable = async (event) => {
+      if (!event.data || event.data.size === 0) return;
+      
+      chunks.push(event.data);
+      audioChunksRef.current = chunks;
+      queueSize++;
+      
+      const now = Date.now();
+      if (!isProcessing && now - lastProcessedTime >= ANALYSIS_INTERVAL && queueSize <= MAX_QUEUE_SIZE) {
+        isProcessing = true;
+        lastProcessedTime = now;
+        
+        requestAnimationFrame(async () => {
+          try {
+            // Use last 2 chunks for faster analysis
+            const recentChunks = chunks.slice(-2);
+            const combinedBlob = new Blob(recentChunks, { type: getSupportedAudioMimeType() });
+            
+            if (combinedBlob.size > MIN_CHUNK_SIZE) {
+              const buffer = await combinedBlob.arrayBuffer();
+              const result = await emotionService?.analyzeAudio(buffer);
+              
+              if (result) {
+                analysisCountRef.current++;
+                
+                // Adjust confidence calculation
+                const newConfidence = Math.min(0.95, Math.max(0.3,
+                  0.3 + // Base confidence
+                  (analysisCountRef.current * 0.1) + // More weight on analysis count
+                  (audioState.duration * 0.05) // Less weight on duration
+                ));
+                
+                // More responsive smoothing
+                const smoothedState = {
+                  stress: smoothValue(result.emotionalState.stress, lastEmotionalStateRef.current.stress, 0.5),
+                  clarity: smoothValue(result.emotionalState.clarity, lastEmotionalStateRef.current.clarity, 0.5),
+                  engagement: smoothValue(result.emotionalState.engagement, lastEmotionalStateRef.current.engagement, 0.5)
+                };
+                
+                // Update Redux state with proper confidence
+                dispatch(updateEmotionalState({
+                  emotionalState: smoothedState,
+                  confidence: newConfidence,
+                  weight: 1.0
+                }));
+                
+                // Update local refs
+                lastEmotionalStateRef.current = smoothedState;
+                confidenceRef.current = newConfidence * 100;
+                
+                // Update UI with more detailed feedback
+                debouncedStateUpdate({
+                  emotionalFeedback: {
+                    analysis: result.analysis || "Analyzing your speech patterns...",
+                    suggestions: [
+                      `Stress level: ${smoothedState.stress}% - ${getStressLevel(smoothedState.stress)}`,
+                      `Speech clarity: ${smoothedState.clarity}% - ${getClarityLevel(smoothedState.clarity)}`,
+                      `Engagement: ${smoothedState.engagement}% - ${getEngagementLevel(smoothedState.engagement)}`,
+                      ...(result.suggestions || ["Continue speaking naturally"])
+                    ],
+                    confidence: newConfidence * 100
+                  }
+                });
+              }
+            }
+
+            // Maintain smaller queue for faster processing
+            if (queueSize > MAX_QUEUE_SIZE) {
+              chunks = chunks.slice(-MAX_QUEUE_SIZE);
+              audioChunksRef.current = chunks;
+              queueSize = MAX_QUEUE_SIZE;
+            }
+          } catch (error) {
+            console.error('Error processing audio chunk:', error);
+          } finally {
+            isProcessing = false;
+          }
+        });
+      }
+    };
+
+    recorder.onerror = async (event) => {
+      console.error('MediaRecorder error:', event);
+      await cleanupRecording();
+    };
+
+    // Use smaller timeslices for more frequent updates
+    recorder.start(25); // Reduced from 50ms to 25ms
+  }, [dispatch, emotionService, cleanupRecording, audioState.duration]);
+
+  // Effect to update mode on mount
+  useEffect(() => {
+    dispatch(setMode('audio'));
+    
+    // Initialize with proper state structure
+    dispatch(updateEmotionalState({
+      emotionalState: { stress: 50, clarity: 50, engagement: 50 },
+      confidence: 0.3,
+      weight: 1.0
+    }));
+    
+    return () => {
+      dispatch(resetEmotionalStates());
+    };
+  }, [dispatch]);
+
+  // Update analysis function
+  const updateAnalysis = useCallback(async (audioData: ArrayBuffer) => {
+    if (!emotionService || !audioState.isRecording || analysisInProgressRef.current) {
+      return;
+    }
+
+    const now = Date.now();
+    if (now - lastAnalysisTimeRef.current < 50) { // 50ms minimum between analyses
+      return;
+    }
+
+    analysisInProgressRef.current = true;
+    lastAnalysisTimeRef.current = now;
+
+    try {
+      const result = await emotionService.analyzeAudio(audioData);
+      
+      // Smooth the transition from previous state
+      const smoothedAnalysis = {
+        emotionalState: {
+          stress: smoothValue(result.emotionalState.stress, lastEmotionalStateRef.current.stress, 0.7),
+          clarity: smoothValue(result.emotionalState.clarity, lastEmotionalStateRef.current.clarity, 0.7),
+          engagement: smoothValue(result.emotionalState.engagement, lastEmotionalStateRef.current.engagement, 0.7)
+        },
+        confidence: confidenceRef.current,
+        weight: 1.0
+      };
+
+      // Update Redux state
+      debouncedEmotionalStateUpdate(smoothedAnalysis);
+      
+      // Update local refs
+      lastEmotionalStateRef.current = smoothedAnalysis.emotionalState;
+
+    } catch (error) {
+      console.error('Analysis error:', error);
+    } finally {
+      analysisInProgressRef.current = false;
+    }
+  }, [emotionService, dispatch, audioState.isRecording]);
+
+  // Add helper functions inside component
+  const getSupportedAudioMimeType = () => {
+    const preferredTypes = [
+      'audio/wav',
+      'audio/webm;codecs=pcm',
+      'audio/webm;codecs=opus',
+      'audio/webm',
+      'audio/ogg;codecs=opus',
+      'audio/ogg'
+    ];
+
+    for (const type of preferredTypes) {
+      if (MediaRecorder.isTypeSupported(type)) {
+        return type;
+      }
+    }
+    return '';
+  };
+
+  const smoothValue = (newValue: number, oldValue: number, factor: number) => {
+    // Increase smoothing factor for more noticeable changes
+    return Math.round(oldValue + (newValue - oldValue) * Math.min(1, factor * 1.5));
+  };
+
+  // Add refs
+  const recognitionRef = useRef<SpeechRecognition | null>(null);
+  const timeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const cleanupTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const currentAudioRef = useRef<HTMLAudioElement | null>(null);
+  const visualizerRef = useRef<HTMLCanvasElement | null>(null);
+
+  // Add training data service
+  const trainingDataServiceRef = useRef<TrainingDataService | null>(null);
+
+  // Add this state for the analyser node
+  const [analyserNode, setAnalyserNode] = useState<AnalyserNode | null>(null);
+  const [animationFrameId, setAnimationFrameId] = useState<number | null>(null);
+  const canvasCtxRef = useRef<CanvasRenderingContext2D | null>(null);
+  const animationRef = useRef<number | null>(null);
+
+  // Add storage management utilities
+  const STORAGE_KEY = 'audioMessages';
+  const MAX_MESSAGES = 10; // Maximum number of messages to store
+
+  // Add performance optimization flags
+  const RECORDING_TIMEOUT = 60000; // Increase from 30s to 60s
+  const CLEANUP_TIMEOUT = 3000; // 3 seconds timeout for cleanup
+  const ANALYSIS_TIMEOUT = 5000;   // Increase from 3s to 5s
+
+  const saveMessagesToStorage = (messages: AudioMessage[]) => {
+    try {
+      // Keep only the latest MAX_MESSAGES
+      const messagesToStore = messages.slice(-MAX_MESSAGES);
+      
+      // Convert ArrayBuffer to base64 for storage
+      const serializedMessages = messagesToStore.map(msg => ({
+        ...msg,
+        buffer: arrayBufferToBase64(msg.buffer)
+      }));
+      
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(serializedMessages));
+    } catch (error: unknown) {
+      console.error('Error saving messages:', error);
+      // If quota exceeded, remove oldest messages until it fits
+      if (error instanceof Error && error.name === 'QuotaExceededError') {
+        const currentMessages = messages.slice(-Math.floor(MAX_MESSAGES / 2));
+        saveMessagesToStorage(currentMessages);
+      }
+    }
+  };
+
+  const loadMessagesFromStorage = (): AudioMessage[] => {
+    try {
+      const stored = localStorage.getItem(STORAGE_KEY);
+      if (!stored) return [];
+      
+      const parsedMessages = JSON.parse(stored);
+      return parsedMessages.map((msg: any) => ({
+        ...msg,
+        buffer: base64ToArrayBuffer(msg.buffer)
+      }));
+    } catch (error) {
+      console.error('Error loading messages:', error);
+      return [];
+    }
+  };
+
+  // Update error recovery mechanism
+  const recoverFromError = async () => {
+    try {
+      // Stop all ongoing processes
+      await cleanupRecording();
+      
+      // Reset all refs immediately
+      mediaRecorderRef.current = null;
+      audioContextRef.current = null;
+      recognitionRef.current = null;
+      audioChunksRef.current = [];
+      
+      // Cancel any pending animations
+      if (animationRef.current) {
+        cancelAnimationFrame(animationRef.current);
+        animationRef.current = null;
+      }
+
+      // Clear canvas
+      if (canvasRef.current) {
+        const ctx = canvasRef.current.getContext('2d');
+        if (ctx) {
+          ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+        }
+      }
+
+      // Reset state immediately
+      setAudioState({
+        isRecording: false,
+        isPlaying: false,
+        duration: 0,
+        audioLevel: 0,
+        timeRemaining: 60,
+        transcription: '',
+        isAnalyzing: false,
+        emotionalFeedback: undefined,
+        isPlaybackLocked: false,
+        confidence: 30
+      });
+      
+      setError(null);
+      setAnalyserNode(null);
+      
+      // Reset emotional state with proper structure
+      const initialState = {
+        emotionalState: { stress: 50, clarity: 50, engagement: 50 },
+        confidence: 0.3,
+        weight: 1.0
+      };
+      lastEmotionalStateRef.current = initialState.emotionalState;
+      dispatch(updateEmotionalState(initialState));
+
+      // Wait a moment before reinitializing
+      await new Promise(resolve => setTimeout(resolve, 1000));
+
+      // Reinitialize emotion service
+      if (emotionService) {
+        try {
+          await emotionService.reset();
+        } catch (e) {
+          console.error('Error resetting emotion service:', e);
+          setError('Failed to reset emotion analysis. Please refresh the page.');
+        }
+      }
+
+    } catch (error) {
+      console.error('Error during recovery:', error);
+      setError('Failed to recover from error. Please refresh the page.');
+    }
+  };
+
+  // Add error boundary effect
+  useEffect(() => {
+    const handleError = async () => {
+      if (audioState.isRecording) {
+        await recoverFromError();
+      }
+    };
+
+    window.addEventListener('error', handleError);
+    window.addEventListener('unhandledrejection', handleError);
+
+    return () => {
+      window.removeEventListener('error', handleError);
+      window.removeEventListener('unhandledrejection', handleError);
+    };
+  }, [audioState.isRecording]);
+
+  // Update the initialization effect
   useEffect(() => {
     const initService = async () => {
       try {
         setError('Initializing emotion analysis...');
         const service = await EmotionAnalysisService.getInstance();
         setEmotionService(service);
-        setIsModelReady(true);
         setError(null);
-        // Set mode to audio when component mounts
-        dispatch(setMode('audio'));
       } catch (error) {
         console.error('Error initializing emotion service:', error);
         setError('Failed to initialize emotion analysis. Please refresh the page.');
-        setIsModelReady(false);
       }
     };
 
     initService();
-    
-    // Reset mode when component unmounts
-    return () => {
-      dispatch(setMode('text'));
+  }, []);
+
+  useEffect(() => {
+    const initTrainingService = async () => {
+      const service = TrainingDataService.getInstance();
+      trainingDataServiceRef.current = service;
     };
-  }, [dispatch]);
+    initTrainingService();
+  }, []);
 
   // Validate a single message
   const validateMessage = (message: AudioMessage): boolean => {
-    try {
-      debugLog('Starting message validation', {
-        messageId: message?.id,
-        hasBuffer: !!message?.buffer,
-        bufferType: message?.buffer ? message.buffer.constructor.name : 'none',
-        bufferSize: message?.buffer?.byteLength || 0,
-        duration: message?.duration,
-        timestamp: message?.timestamp,
-        emotionalState: JSON.stringify(message?.emotionalState)
+    const now = Date.now();
+    const oneYearAgo = now - (365 * 24 * 60 * 60 * 1000);
+    
+    // Metadata validation
+    const hasValidMetadata = typeof message.id === 'string' &&
+                           message.id.length > 0 &&
+                           typeof message.timestamp === 'number' &&
+                           message.timestamp > oneYearAgo &&
+                           message.timestamp <= now;
+
+    if (!hasValidMetadata) {
+      debugLog.audio('Metadata validation failed', {
+        id: typeof message.id,
+        idLength: message.id?.length,
+        timestamp: typeof message.timestamp,
+        timestampValue: message.timestamp,
+        timestampTooOld: message.timestamp < oneYearAgo,
+        timestampInFuture: message.timestamp > now
       });
-
-      // Basic message structure check
-      if (!message) {
-        debugLog('❌ Invalid message: null or undefined');
-        return false;
-      }
-
-      // Buffer validation with more comprehensive checks
-      const hasValidBuffer = message.buffer && 
-                           message.buffer instanceof ArrayBuffer && 
-                           message.buffer.byteLength > 100 && // Minimum size check
-                           message.buffer.byteLength < 10 * 1024 * 1024; // Max 10MB
-      
-      if (!hasValidBuffer) {
-        debugLog('❌ Buffer validation failed', {
-          exists: !!message.buffer,
-          isArrayBuffer: message.buffer instanceof ArrayBuffer,
-          size: message.buffer?.byteLength,
-          tooSmall: message.buffer?.byteLength < 100,
-          tooLarge: message.buffer?.byteLength > 10 * 1024 * 1024
-        });
-        return false;
-      } else {
-        debugLog('✅ Buffer validation passed');
-      }
-
-      // Duration validation
-      const hasValidDuration = typeof message.duration === 'number' &&
-                             message.duration > 0 &&
-                             message.duration <= 300; // Max 5 minutes
-      
-      if (!hasValidDuration) {
-        debugLog('❌ Duration validation failed', {
-          type: typeof message.duration,
-          value: message.duration
-        });
-        return false;
-      }
-
-      // Metadata validation with timestamp range check
-      const now = Date.now();
-      const oneYearAgo = now - (365 * 24 * 60 * 60 * 1000);
-      const hasValidMetadata = typeof message.id === 'string' &&
-                             message.id.length > 0 &&
-                             typeof message.timestamp === 'number' &&
-                             message.timestamp > oneYearAgo &&
-                             message.timestamp <= now;
-
-      if (!hasValidMetadata) {
-        debugLog('❌ Metadata validation failed', {
-          id: typeof message.id,
-          idLength: message.id?.length,
-          timestamp: typeof message.timestamp,
-          timestampValue: message.timestamp,
-          timestampTooOld: message.timestamp < oneYearAgo,
-          timestampInFuture: message.timestamp > now
-        });
-        return false;
-      }
-
-      // Emotional state validation
-      const hasValidEmotionalState = message.emotionalState &&
-                                   typeof message.emotionalState === 'object' &&
-                                   'stress' in message.emotionalState &&
-                                   'clarity' in message.emotionalState &&
-                                   'engagement' in message.emotionalState &&
-                                   Object.values(message.emotionalState).every(value => 
-                                     typeof value === 'number' &&
-                                     !isNaN(value) &&
-                                     isFinite(value) &&
-                                     value >= 0 &&
-                                     value <= 100
-                                   );
-
-      if (!hasValidEmotionalState) {
-        debugLog('❌ Emotional state validation failed', {
-          exists: !!message.emotionalState,
-          type: typeof message.emotionalState,
-          values: message.emotionalState
-        });
-        return false;
-      }
-
-      debugLog('✅ All validations passed');
-      return true;
-
-    } catch (error) {
-      debugLog('❌ Error during message validation:', error);
       return false;
     }
+
+    // Emotional state validation using shared utility
+    if (!validateEmotionalState(message.emotionalState)) {
+      debugLog.audio('Emotional state validation failed', {
+        emotionalState: message.emotionalState
+      });
+      return false;
+    }
+
+    debugLog.audio('All validations passed');
+    return true;
   };
 
-  // Load messages from localStorage on mount
+  // Load messages on component mount
   useEffect(() => {
-    try {
-      const savedMessages = localStorage.getItem('audioMessages');
-      if (savedMessages) {
-        debugLog('Loading saved messages from storage');
-        const parsedMessages = JSON.parse(savedMessages);
-        
-        // Convert and validate each message
-        const validMessages = parsedMessages
-          .map((msg: any) => {
-            try {
-              const message = {
-                ...msg,
-                buffer: base64ToArrayBuffer(msg.buffer)
-              };
-              const isValid = validateMessage(message);
-              return isValid ? { ...message, valid: true } : null;
-            } catch (error) {
-              debugLog('Error converting message:', error);
-              return null;
-            }
-          })
-          .filter(Boolean);
-
-        debugLog('Loaded messages', {
-          total: parsedMessages.length,
-          valid: validMessages.length
-        });
-
-        if (validMessages.length > 0) {
-          setMessages(validMessages);
-        } else {
-          localStorage.removeItem('audioMessages');
-        }
-      }
-    } catch (error) {
-      console.error('Error loading saved messages:', error);
-      localStorage.removeItem('audioMessages');
+    const storedMessages = loadMessagesFromStorage();
+    if (storedMessages.length > 0) {
+      setMessages(storedMessages);
     }
   }, []);
 
-  // Save messages to localStorage when updated
+  // Update the useEffect that saves messages
   useEffect(() => {
-    try {
-      // Only save valid messages
-      const validMessages = messages.filter(validateMessage);
-      
-      if (validMessages.length !== messages.length) {
-        debugLog('Some messages were invalid', {
-          total: messages.length,
-          valid: validMessages.length
-        });
-        // Update state to remove invalid messages
-        setMessages(validMessages);
-      }
-
-      if (validMessages.length > 0) {
-        const messagesToStore = validMessages.map(msg => ({
-          ...msg,
-          buffer: arrayBufferToBase64(msg.buffer)
-        }));
-        localStorage.setItem('audioMessages', JSON.stringify(messagesToStore));
-        debugLog('Saved messages to storage', { count: validMessages.length });
-      } else {
-        localStorage.removeItem('audioMessages');
-      }
-    } catch (error) {
-      console.error('Error saving messages:', error);
+    if (messages.length > 0) {
+      saveMessagesToStorage(messages);
     }
   }, [messages]);
 
@@ -351,1398 +878,591 @@ export default function AudioChat() {
     return bytes.buffer;
   };
 
-  useEffect(() => {
-    setupAudioRecording();
-    return () => {
-      if (audioContextRef.current) {
-        audioContextRef.current.close();
-      }
-      if (mediaRecorderRef.current?.state === 'recording') {
-        mediaRecorderRef.current.stop();
-      }
-      // Clean up media stream tracks
-      if (mediaRecorderRef.current?.stream) {
-        mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
-      }
-    };
-  }, []);
-
-  // Add debug logging utility
-  const debugLog = (message: string, data?: any) => {
-    console.log(`[AudioChat Debug] ${message}`, data || '');
-  };
-
-  const createAudioElement = (blob: Blob): Promise<HTMLAudioElement> => {
-    return new Promise((resolve, reject) => {
-      const audio = new Audio();
-      audio.preload = 'auto';
-      
-      audio.addEventListener('error', (e) => {
-        debugLog('Audio element error:', e);
-        reject(new Error('Failed to load audio file'));
-      });
-
-      audio.addEventListener('loadeddata', () => {
-        resolve(audio);
-      });
-
-      audio.src = URL.createObjectURL(blob);
-    });
-  };
-
-  const playMessageWithWebAudio = async (arrayBuffer: ArrayBuffer): Promise<void> => {
-    let audioContext: AudioContext | null = null;
-    let source: AudioBufferSourceNode | null = null;
-
-    try {
-      debugLog('Starting Web Audio playback');
-      audioContext = new AudioContext({
-        latencyHint: 'interactive',
-        sampleRate: 48000
-      });
-
-      debugLog('Decoding audio data');
-      // Create a copy of the array buffer to prevent "neutered ArrayBuffer" errors
-      const bufferCopy = arrayBuffer.slice(0);
-      const audioBuffer = await audioContext.decodeAudioData(bufferCopy);
-      
-      debugLog('Creating audio source', {
-        duration: audioBuffer.duration,
-        numberOfChannels: audioBuffer.numberOfChannels,
-        sampleRate: audioBuffer.sampleRate
-      });
-
-      source = audioContext.createBufferSource();
-      source.buffer = audioBuffer;
-
-      const gainNode = audioContext.createGain();
-      gainNode.gain.value = 1.0;
-
-      source.connect(gainNode);
-      gainNode.connect(audioContext.destination);
-
-      return new Promise<void>((resolve, reject) => {
-        if (!source) {
-          reject(new Error('Audio source not initialized'));
-          return;
-        }
-
-        source.onended = () => {
-          debugLog('Playback ended normally');
-          setAudioState(prev => ({ ...prev, isPlaying: false }));
-          if (audioContext) {
-            audioContext.close().catch(err => {
-              debugLog('Error closing audio context:', err);
-            });
-          }
-          resolve();
-        };
-
-        source.addEventListener('error', (event: Event) => {
-          debugLog('Playback error event:', event);
-          if (audioContext) {
-            audioContext.close().catch(err => {
-              debugLog('Error closing audio context:', err);
-            });
-          }
-          reject(new Error('Audio playback failed'));
-        });
-
-        try {
-          const startTime = audioContext?.currentTime || 0;
-          source.start(startTime);
-          debugLog('Started playback at time:', startTime);
-        } catch (error) {
-          debugLog('Error starting playback:', error);
-          reject(error);
-        }
-      });
-
-    } catch (error) {
-      debugLog('Web Audio playback error:', error);
-      if (audioContext) {
-        await audioContext.close().catch(err => {
-          debugLog('Error closing audio context:', err);
-        });
-      }
-      throw error;
-    }
-  };
-
-  const playMessageWithAudioElement = async (blob: Blob): Promise<void> => {
-    try {
-      debugLog('Creating audio element for playback');
-      const audio = new Audio();
-      audio.preload = 'auto';
-      
-      const playPromise = new Promise<void>((resolve, reject) => {
-        audio.addEventListener('ended', () => {
-          debugLog('Audio element playback ended');
-          URL.revokeObjectURL(audio.src);
-          setAudioState(prev => ({ ...prev, isPlaying: false }));
-          resolve();
-        }, { once: true });
-
-        audio.addEventListener('error', (e) => {
-          debugLog('Audio element error:', e);
-          URL.revokeObjectURL(audio.src);
-          setAudioState(prev => ({ ...prev, isPlaying: false }));
-          reject(new Error('Audio element playback failed'));
-        }, { once: true });
-
-        audio.addEventListener('canplaythrough', async () => {
-          try {
-            debugLog('Audio can play through, starting playback');
-            await audio.play();
-          } catch (error) {
-            debugLog('Error during audio.play():', error);
-            reject(error);
-          }
-        }, { once: true });
-      });
-
-      audio.src = URL.createObjectURL(blob);
-      return playPromise;
-
-    } catch (error) {
-      debugLog('Audio element playback error:', error);
-      throw error;
-    }
-  };
-
-  const cleanupAudio = () => {
-    debugLog('Cleaning up audio playback');
-    
-    // Stop and cleanup current audio element
-    if (currentAudioRef.current) {
-      try {
-        const audio = currentAudioRef.current;
-        audio.pause();
-        audio.currentTime = 0;
-        
-        // Remove all event listeners
-        audio.onended = null;
-        audio.onpause = null;
-        audio.onplay = null;
-        audio.onerror = null;
-        audio.oncanplaythrough = null;
-        
-        // Clear the source and release object URL if it exists
-        if (audio.src) {
-          const url = audio.src;
-          audio.src = '';
-          URL.revokeObjectURL(url);
-        }
-        
-        currentAudioRef.current = null;
-        debugLog('Audio element cleaned up');
-      } catch (error) {
-        debugLog('Error during audio cleanup:', error);
-      }
-    }
-
-    // Reset audio state
-    setAudioState(prev => ({ 
-      ...prev, 
-      isPlaying: false,
-      audioLevel: 0
-    }));
-
-    // Reset emotional state when playback ends
-    dispatch(updateEmotionalState({
-      stress: 0,
-      clarity: 0,
-      engagement: 0
-    }));
-  };
-
-  const playMessage = async (message: AudioMessage) => {
-    if (!validateMessage(message)) {
-      debugLog('Attempted to play invalid message', { messageId: message.id });
-      setError('Invalid message data. The message may be corrupted.');
-      setMessages(prev => prev.filter(m => m.id !== message.id));
+  // Update visualization function
+  const startVisualization = () => {
+    if (!analyzerNodeRef.current || !canvasRef.current) {
+      debugLog.audio('Cannot start visualization - missing analyzer or canvas');
       return;
     }
 
-    debugLog('Playing message', {
-      id: message.id,
-      bufferSize: message.buffer.byteLength,
-      duration: message.duration,
-      timestamp: message.timestamp,
-      emotionalState: message.emotionalState
-    });
-
-    // Stop any current playback first
-    if (audioState.isPlaying) {
-      debugLog('Stopping current playback');
-      cleanupAudio();
+    const analyser = analyzerNodeRef.current;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) {
+      debugLog.audio('Cannot get canvas context');
+      return;
     }
 
-    try {
-      // Validate audio data
-      if (!message.buffer || message.buffer.byteLength === 0) {
-        throw new Error('Invalid audio data: Empty buffer');
-      }
-
-      // Create blob from buffer with correct MIME type
-      const blob = new Blob([message.buffer], { type: 'audio/webm;codecs=opus' });
-      if (blob.size === 0) {
-        throw new Error('Invalid audio data: Empty blob');
-      }
-
-      debugLog('Created blob for playback', { 
-        size: blob.size,
-        type: blob.type
-      });
-
-      // Create URL for the blob
-      const url = URL.createObjectURL(blob);
-      debugLog('Created blob URL for playback', { url });
-
-      // Create and configure audio element
-      const audio = new Audio();
-      currentAudioRef.current = audio;
-      audio.preload = 'auto';
-
-      // Update emotional state before playback starts
-      dispatch(updateEmotionalState(message.emotionalState));
-
-      // Set up event listeners
-      const playbackPromise = new Promise<void>((resolve, reject) => {
-        const cleanup = () => {
-          debugLog('Cleaning up after playback');
-          audio.removeEventListener('ended', handleEnded);
-          audio.removeEventListener('error', handleError);
-          audio.removeEventListener('canplaythrough', handleCanPlay);
-          URL.revokeObjectURL(url);
-          audio.src = '';
-          currentAudioRef.current = null;
-          setAudioState(prev => ({ ...prev, isPlaying: false }));
-          
-          // Reset emotional state when playback ends
-          dispatch(updateEmotionalState({
-            stress: 0,
-            clarity: 0,
-            engagement: 0
-          }));
-        };
-
-        const handleEnded = () => {
-          debugLog('Playback completed normally');
-          cleanup();
-          resolve();
-        };
-
-        const handleError = (e: Event) => {
-          const mediaError = (e.target as HTMLAudioElement).error;
-          const errorMessage = mediaError 
-            ? `Audio playback failed: ${mediaError.code} - ${mediaError.message}`
-            : 'Audio playback failed: Unknown error';
-          
-          debugLog('Audio playback error:', {
-            error: errorMessage,
-            mediaError,
-            audioState: audio.readyState,
-            currentTime: audio.currentTime,
-            duration: audio.duration,
-            paused: audio.paused,
-            ended: audio.ended,
-            networkState: audio.networkState
-          });
-
-          cleanup();
-          reject(new Error(errorMessage));
-        };
-
-        const handleCanPlay = async () => {
-          debugLog('Audio can play through', {
-            duration: audio.duration,
-            readyState: audio.readyState
-          });
-          try {
-            await audio.play();
-          } catch (error) {
-            handleError(new ErrorEvent('error', { error }));
-          }
-        };
-
-        audio.addEventListener('ended', handleEnded);
-        audio.addEventListener('error', handleError);
-        audio.addEventListener('canplaythrough', handleCanPlay);
-
-        // Set timeout for loading
-        setTimeout(() => {
-          if (audio.readyState === 0) {
-            cleanup();
-            reject(new Error('Audio loading timeout - failed to load audio data'));
-          }
-        }, 5000);
-      });
-
-      // Start loading the audio
-      audio.src = url;
-      setAudioState(prev => ({ ...prev, isPlaying: true }));
-      setError(null);
-
-      await playbackPromise;
-
-    } catch (error) {
-      console.error('Playback error:', error);
-      const errorMessage = error instanceof Error 
-        ? error.message 
-        : 'Failed to play audio message';
-      setError(errorMessage);
+    const bufferLength = analyser.frequencyBinCount;
+    const dataArray = new Uint8Array(bufferLength);
+    
+    const draw = () => {
+      if (!ctx || !analyser) return;
       
-      // Ensure cleanup happens on error
-      cleanupAudio();
+      animationFrameRef.current = requestAnimationFrame(draw);
+      analyser.getByteFrequencyData(dataArray);
+
+      // Clear canvas
+      ctx.fillStyle = 'rgb(20, 24, 33)';
+      ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+      // Calculate average volume
+      const average = dataArray.reduce((a, b) => a + b) / bufferLength;
+      const normalizedVolume = average / 255;
+      
+      // Update audio level in state
+      debouncedStateUpdate({
+        audioLevel: normalizedVolume * 100
+      });
+
+      // Draw visualization
+      const barWidth = (canvas.width / bufferLength) * 2.5;
+      let barHeight;
+      let x = 0;
+
+      for (let i = 0; i < bufferLength; i++) {
+        barHeight = (dataArray[i] / 255) * canvas.height;
+
+        const hue = i / bufferLength * 360;
+        ctx.fillStyle = `hsla(${hue}, 70%, 60%, 0.8)`;
+        
+        ctx.fillRect(x, canvas.height - barHeight, barWidth, barHeight);
+        x += barWidth + 1;
+      }
+    };
+
+    draw();
+  };
+
+  const stopVisualization = () => {
+    if (animationFrameRef.current) {
+      cancelAnimationFrame(animationFrameRef.current);
+      animationFrameRef.current = null;
+    }
+
+    // Clear canvas
+    if (canvasRef.current) {
+      const ctx = canvasRef.current.getContext('2d');
+      if (ctx) {
+        ctx.clearRect(0, 0, canvasRef.current.width, canvasRef.current.height);
+      }
     }
   };
 
-  // Add cleanup on unmount
-  useEffect(() => {
-    return () => {
-      cleanupAudio();
-      if (audioContextRef.current) {
-        audioContextRef.current.close();
-      }
-      if (mediaRecorderRef.current?.state === 'recording') {
-        mediaRecorderRef.current.stop();
-      }
-      if (mediaRecorderRef.current?.stream) {
-        mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
-      }
+  // Update speech recognition setup
+  const setupSpeechRecognition = () => {
+    const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!SpeechRecognition) {
+      console.error('Speech recognition not supported');
+      return null;
+    }
+
+    const recognition = new SpeechRecognition();
+    recognition.continuous = true;
+    recognition.interimResults = true;
+    recognition.lang = 'en-US';
+    recognition.maxAlternatives = 1;
+
+    // Increase reliability with better state management
+    let finalTranscript = '';
+    let interimTranscript = '';
+    let isRestartingRecognition = false;
+
+    recognition.onstart = () => {
+      console.log('Speech recognition started');
+      finalTranscript = '';
+      interimTranscript = '';
+      setError(null);
     };
-  }, []);
 
-  const setupAudioRecording = async () => {
-    const maxSetupRetries = 3;
-    let setupRetryCount = 0;
-    let lastError: Error | null = null;
-
-    while (setupRetryCount < maxSetupRetries) {
-      try {
-        debugLog(`Audio setup attempt ${setupRetryCount + 1}/${maxSetupRetries}`);
+    recognition.onresult = (event) => {
+      for (let i = event.resultIndex; i < event.results.length; i++) {
+        const transcript = event.results[i][0].transcript;
+        const confidence = event.results[i][0].confidence;
         
-        // Clean up any existing resources first
-        await cleanupRecording();
-
-        // Check browser capabilities
-        if (!navigator.mediaDevices) {
-          throw new Error('Media devices not supported. Please try a different browser.');
-        }
-
-        if (!window.AudioContext && !window.webkitAudioContext) {
-          throw new Error('AudioContext not supported. Please try a different browser.');
-        }
-
-        if (!window.MediaRecorder) {
-          throw new Error('MediaRecorder not supported. Please try a different browser.');
-        }
-
-        // Create AudioContext with error handling
-        const AudioContextClass = window.AudioContext || window.webkitAudioContext;
-        const audioContext = new AudioContextClass({
-          latencyHint: 'interactive',
-          sampleRate: 48000
-        });
-
-        // Ensure AudioContext is running
-        if (audioContext.state === 'suspended') {
-          await audioContext.resume();
-          if (audioContext.state === 'suspended') {
-            throw new Error('Failed to resume AudioContext');
-          }
-        }
-
-        // Request audio with specific constraints and fallbacks
-        const constraints: MediaStreamConstraints = {
-          audio: {
-            channelCount: { ideal: 1, min: 1 },
-            sampleRate: { ideal: 48000, min: 44100 },
-            sampleSize: { ideal: 16, min: 16 },
-            echoCancellation: true,
-            noiseSuppression: true,
-            autoGainControl: true
-          }
-        };
-
-        debugLog('Requesting media with constraints:', constraints);
-        
-        let mediaStream: MediaStream;
-        try {
-          mediaStream = await navigator.mediaDevices.getUserMedia(constraints);
-        } catch (streamError) {
-          // Try fallback constraints if initial request fails
-          debugLog('Initial media request failed, trying fallback constraints');
-          mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        }
-
-        if (!mediaStream) {
-          throw new Error('Failed to get media stream');
-        }
-
-        const tracks = mediaStream.getAudioTracks();
-        if (tracks.length === 0) {
-          throw new Error('No audio tracks available');
-        }
-
-        // Enable tracks and verify they are active
-        const activeTrackPromises = tracks.map(async (track) => {
-          track.enabled = true;
-          // Wait briefly to ensure track is actually enabled
-          await new Promise(resolve => setTimeout(resolve, 100));
-          if (!track.enabled || track.muted) {
-            throw new Error(`Failed to enable track: ${track.label}`);
-          }
-          return track;
-        });
-
-        await Promise.all(activeTrackPromises);
-
-        debugLog('Audio tracks:', tracks.map(t => ({
-          label: t.label,
-          enabled: t.enabled,
-          muted: t.muted,
-          readyState: t.readyState,
-          constraints: t.getConstraints()
-        })));
-
-        // Set up audio processing chain with error checking
-        const source = audioContext.createMediaStreamSource(mediaStream);
-        const analyser = audioContext.createAnalyser();
-        analyser.fftSize = 2048;
-        analyser.smoothingTimeConstant = 0.5;
-        analyser.minDecibels = -70;
-        analyser.maxDecibels = -10;
-
-        const gainNode = audioContext.createGain();
-        gainNode.gain.value = 1.5;
-
-        try {
-          source.connect(gainNode);
-          gainNode.connect(analyser);
-        } catch (connectionError: unknown) {
-          const errorMessage = connectionError instanceof Error 
-            ? connectionError.message 
-            : 'Failed to connect audio nodes';
-          throw new Error(errorMessage);
-        }
-
-        // Verify MediaRecorder support for codec
-        if (!MediaRecorder.isTypeSupported('audio/webm;codecs=opus')) {
-          throw new Error('WebM with Opus codec is not supported in this browser.');
-        }
-
-        // Create and configure MediaRecorder with real-time processing
-        const recorder = new MediaRecorder(mediaStream, {
-          mimeType: 'audio/webm;codecs=opus',
-          audioBitsPerSecond: 256000
-        });
-
-        // Handle data as it comes in
-        recorder.ondataavailable = async (event) => {
-          if (event.data && event.data.size > 0) {
-            audioChunksRef.current.push(event.data);
-            // Keep only the last 5 seconds of audio for analysis
-            if (audioChunksRef.current.length > 25) { // 25 chunks at 200ms = 5 seconds
-              audioChunksRef.current.shift();
-            }
-          }
-        };
-
-        // Verify recorder is in correct initial state
-        if (recorder.state !== 'inactive') {
-          throw new Error(`Invalid initial recorder state: ${recorder.state}`);
-        }
-
-        // Store references
-        mediaRecorderRef.current = recorder;
-        audioContextRef.current = audioContext;
-
-        // Set up audio level monitoring with error recovery
-        const setupAudioMonitoring = () => {
-          if (!analyser) return;
-
-          const dataArray = new Uint8Array(analyser.frequencyBinCount);
-          let consecutiveErrors = 0;
-          const maxConsecutiveErrors = 3;
-
-          const updateAudioLevel = () => {
-            if (!analyser || !audioState.isRecording) return;
-
-            try {
-              analyser.getByteFrequencyData(dataArray);
-              consecutiveErrors = 0; // Reset error count on success
-              
-              // Calculate average level with focus on speech frequencies
-              let sum = 0;
-              let count = 0;
-              
-              const startFreq = Math.floor(100 * analyser.frequencyBinCount / (audioContext.sampleRate || 48000));
-              const endFreq = Math.ceil(4000 * analyser.frequencyBinCount / (audioContext.sampleRate || 48000));
-              
-              for (let i = startFreq; i < endFreq; i++) {
-                const freqWeight = 1.0 - Math.abs((i - (startFreq + endFreq) / 2) / (endFreq - startFreq));
-                sum += dataArray[i] * freqWeight;
-                count++;
+        if (event.results[i].isFinal) {
+          finalTranscript += transcript + ' ';
+          // Trigger emotion analysis on final transcripts
+          if (emotionService) {
+            emotionService.analyzeSpeechContext(finalTranscript.trim()).then(feedback => {
+              if (feedback) {
+                const newConfidence = Math.min(0.95, Math.max(0.3, confidence));
+                debouncedStateUpdate({
+                  transcription: finalTranscript.trim(),
+                  emotionalFeedback: {
+                    analysis: feedback.analysis,
+                    suggestions: feedback.suggestions,
+                    confidence: feedback.confidence
+                  }
+                });
               }
-
-              const average = count > 0 ? sum / count : 0;
-              const normalizedLevel = Math.min(100, (average / 255) * 200);
-              
-              const smoothingFactor = normalizedLevel > audioState.audioLevel ? 0.3 : 0.1;
-              const smoothedLevel = audioState.audioLevel * (1 - smoothingFactor) + normalizedLevel * smoothingFactor;
-              
-              const scaledLevel = Math.pow(smoothedLevel / 100, 0.8) * 100;
-
-              setAudioState(prev => ({
-                ...prev,
-                audioLevel: Math.max(0, Math.min(100, scaledLevel))
-              }));
-
-            } catch (error) {
-              consecutiveErrors++;
-              debugLog(`Audio monitoring error (${consecutiveErrors}/${maxConsecutiveErrors}):`, error);
-              
-              if (consecutiveErrors >= maxConsecutiveErrors) {
-                debugLog('Too many consecutive errors, stopping audio monitoring');
-                return;
-              }
-            }
-
-            if (audioState.isRecording) {
-              requestAnimationFrame(updateAudioLevel);
-            }
-          };
-
-          updateAudioLevel();
-        };
-
-        // Set up recorder event handlers with error recovery
-        recorder.onstart = () => {
-          debugLog('Recording started successfully');
-          audioChunksRef.current = [];
-          setupAudioMonitoring();
-        };
-
-        recorder.onerror = (event) => {
-          const error = event.error || new Error('Unknown recorder error');
-          debugLog('MediaRecorder error:', error);
-          
-          // Attempt recovery
-          cleanupRecording().then(() => {
-            setupAudioRecording();
-          }).catch(cleanupError => {
-            debugLog('Failed to recover from MediaRecorder error:', cleanupError);
-            setError('Recording error. Please try again.');
-          });
-        };
-
-        debugLog('Audio setup completed successfully');
-        setError(null);
-        return true;
-
-      } catch (error: unknown) {
-        lastError = error instanceof Error ? error : new Error('Unknown setup error');
-        setupRetryCount++;
-        
-        if (setupRetryCount < maxSetupRetries) {
-          debugLog(`Setup attempt ${setupRetryCount} failed, retrying...`, error);
-          await new Promise(resolve => setTimeout(resolve, 1000 * setupRetryCount));
+            });
+          }
         } else {
-          debugLog('All setup attempts failed:', error);
-          await cleanupRecording();
-          setError(error instanceof Error ? error.message : 'Failed to setup audio recording');
-          return false;
-        }
-      }
-    }
-
-    if (lastError) {
-      throw lastError;
-    }
-    return false;
-  };
-
-  const cleanupRecording = async () => {
-    debugLog('Starting cleanup of recording resources');
-
-    // Reset audio state but preserve emotional state
-    setAudioState(prev => ({
-      ...prev,
-      isRecording: false,
-      isPlaying: false,
-      audioLevel: 0,
-      timeRemaining: 30,
-      duration: 0,
-      transcription: '',
-      isAnalyzing: false
-    }));
-
-    // Stop speech recognition
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-        recognitionRef.current = null;
-      } catch (error) {
-        debugLog('Error stopping speech recognition:', error);
-      }
-    }
-
-    // Track cleanup status
-    const cleanupStatus = {
-      mediaRecorder: false,
-      audioContext: false,
-      tracks: false
-    };
-
-    try {
-      // Stop and cleanup media recorder
-      if (mediaRecorderRef.current) {
-        try {
-          // Stop recording if active
-          if (mediaRecorderRef.current.state === 'recording' || mediaRecorderRef.current.state === 'paused') {
-            mediaRecorderRef.current.stop();
-            debugLog('Stopped active MediaRecorder');
-          }
-          
-          // Clear all intervals and timeouts
-          if (mediaRecorderRef.current.durationInterval) {
-            clearInterval(mediaRecorderRef.current.durationInterval);
-            mediaRecorderRef.current.durationInterval = undefined;
-          }
-
-          // Remove all event listeners
-          mediaRecorderRef.current.ondataavailable = null;
-          mediaRecorderRef.current.onstart = null;
-          mediaRecorderRef.current.onstop = null;
-          mediaRecorderRef.current.onerror = null;
-          mediaRecorderRef.current.onpause = null;
-          mediaRecorderRef.current.onresume = null;
-
-          // Stop and cleanup all tracks
-          if (mediaRecorderRef.current.stream) {
-            const tracks = mediaRecorderRef.current.stream.getTracks();
-            debugLog(`Cleaning up ${tracks.length} media tracks`);
-            
-            await Promise.all(tracks.map(async (track) => {
-              try {
-                track.stop();
-                track.enabled = false;
-                debugLog(`Stopped track: ${track.kind} - ${track.label}`);
-              } catch (trackError) {
-                debugLog(`Error stopping track ${track.kind}:`, trackError);
-              }
-            }));
-            
-            cleanupStatus.tracks = true;
-          }
-
-          mediaRecorderRef.current = null;
-          cleanupStatus.mediaRecorder = true;
-          debugLog('MediaRecorder cleanup completed');
-        } catch (recorderError) {
-          debugLog('Error during MediaRecorder cleanup:', recorderError);
+          interimTranscript = transcript;
         }
       }
 
-      // Close audio context with retry
-      if (audioContextRef.current) {
-        try {
-          const maxRetries = 3;
-          let retryCount = 0;
-          
-          while (retryCount < maxRetries) {
-            try {
-              if (audioContextRef.current.state !== 'closed') {
-                await audioContextRef.current.close();
-                debugLog('AudioContext closed successfully');
-                break;
-              } else {
-                debugLog('AudioContext already closed');
-                break;
-              }
-            } catch (closeError) {
-              retryCount++;
-              debugLog(`AudioContext close attempt ${retryCount} failed:`, closeError);
-              if (retryCount === maxRetries) throw closeError;
-              await new Promise(resolve => setTimeout(resolve, 100 * retryCount));
-            }
-          }
-          
-          audioContextRef.current = null;
-          cleanupStatus.audioContext = true;
-        } catch (contextError) {
-          debugLog('Error during AudioContext cleanup:', contextError);
-        }
-      }
-
-      // Reset state
       setAudioState(prev => ({
         ...prev,
-        isRecording: false,
-        isPlaying: false,
-        audioLevel: 0,
-        timeRemaining: 30,
-        duration: 0
+        transcription: (finalTranscript + interimTranscript).trim()
       }));
+    };
 
-      // Clear chunks and release memory
-      if (audioChunksRef.current.length > 0) {
-        audioChunksRef.current.forEach(chunk => {
-          try {
-            // Explicitly revoke any object URLs that might have been created
-            if (chunk instanceof Blob) {
-              URL.revokeObjectURL(URL.createObjectURL(chunk));
-            }
-          } catch (error) {
-            debugLog('Error cleaning up audio chunk:', error);
-          }
-        });
-        audioChunksRef.current = [];
-      }
-
-      debugLog('Cleanup completed', cleanupStatus);
-    } catch (error) {
-      debugLog('Error during cleanup:', error);
-      throw error;
-    }
-  };
-
-  // Update the speech recognition setup with proper types
-  const setupSpeechRecognition = () => {
-    const SpeechRecognitionAPI = window.SpeechRecognition || window.webkitSpeechRecognition;
-    
-    if (SpeechRecognitionAPI) {
-      const recognition = new SpeechRecognitionAPI();
-      
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = 'en-US';
-
-      // Handle interim results for more responsive feedback
-      recognition.onresult = async (event: SpeechRecognitionEvent) => {
-        let finalTranscript = '';
-        let interimTranscript = '';
-
-        for (let i = event.resultIndex; i < event.results.length; i++) {
-          const transcript = event.results[i][0].transcript;
-          if (event.results[i].isFinal) {
-            finalTranscript += transcript;
-          } else {
-            interimTranscript += transcript;
-          }
-        }
-
-        const currentTranscript = finalTranscript + interimTranscript;
-        
-        setAudioState(prev => ({
-          ...prev,
-          transcription: currentTranscript,
-          isAnalyzing: true,
-          emotionalFeedback: prev.emotionalFeedback || {
-            analysis: "Analyzing your speech...",
-            suggestions: ["Continue speaking naturally"],
-            confidence: 50
-          }
-        }));
-
-        // Trigger analysis even with interim results for more responsive feedback
-        if (currentTranscript && emotionService) {
-          try {
-            const feedback = await emotionService.analyzeSpeechContext(
-              `Speech: "${currentTranscript}"
-              Stress Level: ${currentEmotionalState.stress}%
-              Clarity: ${currentEmotionalState.clarity}%
-              Engagement: ${currentEmotionalState.engagement}%`
-            );
-            
-            setAudioState(prev => ({
-              ...prev,
-              emotionalFeedback: feedback,
-              isAnalyzing: false
-            }));
-          } catch (error) {
-            console.error('Error analyzing speech:', error);
-          }
-        }
-      };
-
-      recognition.onerror = (event: SpeechRecognitionErrorEvent) => {
-        debugLog('Speech recognition error:', event.error);
-        // Attempt to restart recognition on error
-        if (event.error === 'network' || event.error === 'service-not-allowed') {
-          try {
-            recognition.stop();
-            setTimeout(() => {
+    recognition.onerror = (event) => {
+      console.error('Speech recognition error:', event.error);
+      if (event.error === 'no-speech' || event.error === 'audio-capture') {
+        // Attempt to restart recognition
+        try {
+          recognition.stop();
+          setTimeout(() => {
+            if (audioState.isRecording) {
               recognition.start();
-            }, 1000);
-          } catch (e) {
-            debugLog('Error restarting recognition:', e);
-          }
+            }
+          }, 1000);
+        } catch (e) {
+          console.error('Error restarting recognition:', e);
         }
-      };
-
-      recognition.onend = () => {
-        // Attempt to restart recognition if still recording
-        if (audioState.isRecording) {
-          try {
-            recognition.start();
-          } catch (e) {
-            debugLog('Error restarting recognition:', e);
-          }
-        }
-      };
-
-      recognitionRef.current = recognition;
-    } else {
-      debugLog('Speech recognition not supported in this browser');
-    }
-  };
-
-  // Add LLM analysis function
-  const analyzeSpeechContext = async (
-    transcription: string,
-    emotionalState: EmotionalState
-  ): Promise<EmotionalFeedback> => {
-    try {
-      if (!emotionService) {
-        return {
-          analysis: "Unable to analyze speech context - service not initialized",
-          suggestions: [],
-          confidence: 0
-        };
+      } else {
+        setError(`Speech recognition error: ${event.error}`);
       }
+    };
 
-      // Format the prompt for the LLM
-      const prompt = `
-        Analyze the following speech and emotional metrics:
-        
-        Speech: "${transcription}"
-        
-        Emotional Metrics:
-        - Stress Level: ${emotionalState.stress}%
-        - Clarity: ${emotionalState.clarity}%
-        - Engagement: ${emotionalState.engagement}%
-        
-        Provide a brief analysis of the speaker's emotional state and communication effectiveness.
-        Also suggest up to 2 ways they could improve their communication.
-        Format as JSON with fields: analysis (string), suggestions (array of strings), confidence (number 0-100)
-      `;
+    recognition.onend = () => {
+      console.log('Speech recognition ended');
+      // Automatically restart if still recording
+      if (audioState.isRecording) {
+        try {
+          recognition.start();
+        } catch (e) {
+          console.error('Error restarting recognition:', e);
+        }
+      }
+    };
 
-      // Call your LLM service here
-      const response = await emotionService.analyzeSpeechContext(prompt);
-      return response;
-    } catch (error) {
-      debugLog('LLM analysis error:', error);
-      return {
-        analysis: "Unable to analyze speech context",
-        suggestions: [],
-        confidence: 0
-      };
-    }
+    return recognition;
   };
 
-  // Modify startRecording to include improved timer and analysis sync
+  // Start recording function
   const startRecording = async () => {
     if (!emotionService) {
-      setError('Emotion analysis is initializing. Please wait a moment and try again.');
-      return;
-    }
-
-    if (!isModelReady) {
-      setError('Emotion analysis is not ready. Please wait a moment and try again.');
+      setError('Emotion analysis service not initialized');
       return;
     }
 
     try {
-      debugLog('Starting new recording');
-      
-      // Clean up any existing recording first
+      // If already recording, stop first
+      if (audioState.isRecording || mediaRecorderRef.current?.state === 'recording') {
+        await stopRecording();
+        // Wait a brief moment for cleanup
+        await new Promise(resolve => setTimeout(resolve, 300));
+      }
+
+      // Ensure clean state before starting
       await cleanupRecording();
-      
+
       const success = await setupAudioRecording();
       if (!success || !mediaRecorderRef.current) {
         throw new Error('Failed to setup audio recording');
       }
 
-      const startTime = Date.now();
-      const MAX_DURATION = 30; // 30 seconds maximum
+      // Initialize speech recognition
+      const recognition = setupSpeechRecognition();
+      if (recognition) {
+        recognitionRef.current = recognition;
+        recognition.start();
+      }
 
-      // Initialize with default state
-      setAudioState(prev => ({ 
-        ...prev, 
+      setAudioState(prev => ({
+        ...prev,
         isRecording: true,
         duration: 0,
-        timeRemaining: MAX_DURATION,
-        isAnalyzing: false,
+        timeRemaining: 60,
         transcription: '',
+        isAnalyzing: false,
         emotionalFeedback: {
           analysis: "Recording started. Begin speaking to see analysis...",
           suggestions: ["Speak naturally to begin analysis"],
-          confidence: 75
+          confidence: 30
         }
       }));
 
-      // Start speech recognition with improved error handling
-      setupSpeechRecognition();
-      if (recognitionRef.current) {
-        try {
-          recognitionRef.current.start();
-        } catch (error) {
-          debugLog('Error starting speech recognition:', error);
-        }
+      // Only start if we're not already recording
+      if (mediaRecorderRef.current.state !== 'recording') {
+        mediaRecorderRef.current.start(100);
+        startVisualization();
       }
-
-      setError(null);
-      
-      // Start recording with smaller chunk size for more frequent updates
-      mediaRecorderRef.current.start(100);
-
-      // Set up real-time emotion analysis with better sync
-      let analysisInProgress = false;
-      let lastLLMUpdate = Date.now();
-      const LLM_UPDATE_INTERVAL = 300; // Fast updates for responsive feedback
-      let lastEmotionalState = { ...currentEmotionalState };
-
-      // Improved timer handling
-      if (mediaRecorderRef.current.durationInterval) {
-        clearInterval(mediaRecorderRef.current.durationInterval);
-      }
-
-      mediaRecorderRef.current.durationInterval = setInterval(() => {
-        const currentTime = Date.now();
-        const elapsedTime = (currentTime - startTime) / 1000;
-        const remainingTime = Math.max(0, MAX_DURATION - elapsedTime);
-        
-        setAudioState(prev => ({ 
-          ...prev, 
-          duration: elapsedTime,
-          timeRemaining: remainingTime
-        }));
-
-        // Handle recording end
-        if (remainingTime <= 0) {
-          clearInterval(mediaRecorderRef.current?.durationInterval);
-          stopRecording();
-          setError('Maximum recording duration reached (30 seconds)');
-        } else if (remainingTime <= 5) {
-          setError(`Recording will end in ${Math.ceil(remainingTime)} seconds`);
-        }
-      }, 100);
-
-      mediaRecorderRef.current.ondataavailable = async (event) => {
-        if (event.data.size > 0) {
-          audioChunksRef.current.push(event.data);
-          
-          if (!analysisInProgress) {
-            analysisInProgress = true;
-            try {
-              const combinedBlob = new Blob(audioChunksRef.current.slice(-5), { type: 'audio/webm;codecs=opus' });
-              const buffer = await combinedBlob.arrayBuffer();
-              
-              const analysis = await emotionService.analyzeAudio(buffer);
-              const currentTime = Date.now();
-
-              // Prevent sudden large changes in emotional values
-              const smoothedAnalysis = {
-                stress: smoothValue(analysis.stress, lastEmotionalState.stress, 0.7),
-                clarity: smoothValue(analysis.clarity, lastEmotionalState.clarity, 0.7),
-                engagement: smoothValue(analysis.engagement, lastEmotionalState.engagement, 0.7)
-              };
-              
-              // Update emotional state
-              dispatch(updateEmotionalState(smoothedAnalysis));
-              lastEmotionalState = smoothedAnalysis;
-
-              // Update LLM analysis if we have transcription and values have changed significantly
-              if (audioState.transcription && 
-                  (currentTime - lastLLMUpdate >= LLM_UPDATE_INTERVAL || 
-                   hasSignificantChange(smoothedAnalysis, lastEmotionalState))) {
-                const feedback = await emotionService.analyzeSpeechContext(
-                  `Speech: "${audioState.transcription}"
-                  Stress Level: ${smoothedAnalysis.stress}%
-                  Clarity: ${smoothedAnalysis.clarity}%
-                  Engagement: ${smoothedAnalysis.engagement}%`
-                );
-                
-                setAudioState(prev => ({
-                  ...prev,
-                  emotionalFeedback: feedback,
-                  isAnalyzing: false
-                }));
-                
-                lastLLMUpdate = currentTime;
-              }
-            } catch (error) {
-              console.error('Error in real-time analysis:', error);
-            } finally {
-              analysisInProgress = false;
-            }
-          }
-        }
-      };
-
-      // Add cleanup handler
-      mediaRecorderRef.current.onstop = () => {
-        if (mediaRecorderRef.current?.durationInterval) {
-          clearInterval(mediaRecorderRef.current.durationInterval);
-        }
-      };
-
     } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : 'Failed to start recording. Please try again.';
-      setError(errorMessage);
       console.error('Error starting recording:', error);
+      setError(error instanceof Error ? error.message : 'Failed to start recording');
       await cleanupRecording();
     }
   };
 
-  // Helper function to smooth value changes
-  const smoothValue = (newValue: number, oldValue: number, factor: number) => {
-    return Math.round(oldValue + (newValue - oldValue) * factor);
-  };
-
-  // Helper function to detect significant changes in emotional state
-  const hasSignificantChange = (newState: EmotionalState, oldState: EmotionalState) => {
-    const threshold = 5; // 5% change threshold
-    return Math.abs(newState.stress - oldState.stress) > threshold ||
-           Math.abs(newState.clarity - oldState.clarity) > threshold ||
-           Math.abs(newState.engagement - oldState.engagement) > threshold;
-  };
-
-  // Modify stopRecording to use cleanupRecording
+  // Stop recording function
   const stopRecording = async () => {
-    if (!mediaRecorderRef.current || !audioState.isRecording) {
-      debugLog('❌ Cannot stop recording - no active recorder or not recording');
-      return;
-    }
-
     try {
-      debugLog('🎤 Stopping recording', {
-        recorderState: mediaRecorderRef.current.state,
-        duration: audioState.duration,
-        chunks: audioChunksRef.current.length
-      });
-
-      // Preserve the current emotional state
-      const finalEmotionalState = { ...currentEmotionalState };
-
-      // Get final chunk of audio data with extended timeout
-      const finalDataPromise = new Promise<void>((resolve, reject) => {
-        if (!mediaRecorderRef.current) return resolve();
-        
-        const timeout = setTimeout(() => {
-          reject(new Error('Timeout waiting for final audio chunk'));
-        }, 5000);
-
-        const handleDataAvailable = (event: BlobEvent) => {
-          clearTimeout(timeout);
-          if (event.data && event.data.size > 0) {
-            audioChunksRef.current.push(event.data);
-            debugLog('Received final audio chunk', { 
-              size: event.data.size,
-              type: event.data.type,
-              totalChunks: audioChunksRef.current.length
-            });
-          }
-          resolve();
-        };
-
-        mediaRecorderRef.current.addEventListener('dataavailable', handleDataAvailable, { once: true });
-      });
-
-      // Stop recording and wait for final data
-      mediaRecorderRef.current.stop();
-      await finalDataPromise;
-
-      // Verify we have audio data with more lenient size check
-      const totalSize = audioChunksRef.current.reduce((size, chunk) => size + chunk.size, 0);
-      debugLog('Total recorded audio size:', { totalSize });
-
-      if (totalSize < 100) { // More lenient minimum size
-        throw new Error('Insufficient audio data recorded. Please try speaking louder or closer to the microphone.');
+      // Only stop if we're actually recording
+      if (mediaRecorderRef.current?.state === 'recording') {
+        mediaRecorderRef.current.stop();
       }
-
-      // Create blob with all chunks
-      const audioBlob = new Blob(audioChunksRef.current, { 
-        type: 'audio/webm;codecs=opus' 
-      });
-
-      debugLog('Created audio blob', {
-        size: audioBlob.size,
-        type: audioBlob.type
-      });
-
-      // Convert to array buffer with retry
-      let arrayBuffer: ArrayBuffer;
-      try {
-        arrayBuffer = await audioBlob.arrayBuffer();
-      } catch (error) {
-        debugLog('First attempt to get array buffer failed, retrying...');
-        await new Promise(resolve => setTimeout(resolve, 100));
-        arrayBuffer = await audioBlob.arrayBuffer();
-      }
-      
-      if (arrayBuffer.byteLength < 100) {
-        throw new Error('Audio data is too small. Please try speaking louder or closer to the microphone.');
-      }
-
-      debugLog('Converted to array buffer', {
-        byteLength: arrayBuffer.byteLength
-      });
-
-      setIsAnalyzing(true);
-      try {
-        if (!emotionService) {
-          throw new Error('Emotion analysis service not initialized');
-        }
-
-        debugLog('📝 Creating new message');
-        const newMessage: AudioMessage = {
-          id: Date.now().toString(),
-          buffer: arrayBuffer,
-          duration: audioState.duration,
-          timestamp: Date.now(),
-          emotionalState: finalEmotionalState, // Use the preserved emotional state
-          valid: true
-        };
-
-        debugLog('🔍 Performing initial validation');
-        if (!validateMessage(newMessage)) {
-          debugLog('⚠️ Initial validation failed, using baseline values');
-          setMessages(prev => [...prev, newMessage]);
-          dispatch(updateEmotionalState(newMessage.emotionalState));
-          return;
-        }
-        debugLog('✅ Initial validation passed');
-
-        try {
-          debugLog('🧠 Starting emotion analysis');
-          const analysis = await emotionService.analyzeAudio(arrayBuffer);
-          debugLog('✅ Emotion analysis complete', {
-            stress: analysis.stress,
-            clarity: analysis.clarity,
-            engagement: analysis.engagement
-          });
-
-          // Validate analysis values before updating
-          const validatedState = {
-            stress: !isNaN(analysis.stress) && isFinite(analysis.stress) ? analysis.stress : 55,
-            clarity: !isNaN(analysis.clarity) && isFinite(analysis.clarity) ? analysis.clarity : 54,
-            engagement: !isNaN(analysis.engagement) && isFinite(analysis.engagement) ? analysis.engagement : 58
-          };
-
-          newMessage.emotionalState = validatedState;
-          debugLog('✅ Validated emotional state:', validatedState);
-        } catch (analysisError) {
-          debugLog('⚠️ Emotion analysis failed, using baseline values', analysisError);
-          // Keep using the default baseline values
-        }
-
-        debugLog('🔍 Performing final validation');
-        if (!validateMessage(newMessage)) {
-          debugLog('⚠️ Final validation failed, using baseline values');
-          setMessages(prev => [...prev, newMessage]);
-          dispatch(updateEmotionalState(newMessage.emotionalState));
-          return;
-        }
-        debugLog('✅ Final validation passed');
-
-        debugLog('💾 Saving message and updating state');
-        setMessages(prev => [...prev, newMessage]);
-        dispatch(updateEmotionalState(newMessage.emotionalState));
-        dispatch(addToHistory({
-          message: `Audio message recorded (${Math.round(newMessage.duration)}s)`,
-          emotionalState: newMessage.emotionalState,
-        }));
-        
-        setError(null);
-        debugLog('✅ Recording process completed successfully');
-        
-      } catch (error) {
-        debugLog('❌ Error during recording process:', error);
-        // Keep the final emotional state even if there's an error
-        dispatch(updateEmotionalState(finalEmotionalState));
-        throw error;
-      } finally {
-        setIsAnalyzing(false);
-        await cleanupRecording();
-      }
-
+      stopVisualization();
+      await cleanupRecording(); // Use the full cleanup instead of just cleanupAudioResources
     } catch (error) {
       console.error('Error stopping recording:', error);
-      const errorMessage = error instanceof Error 
-        ? error.message 
-        : 'Failed to process recording. Please try again.';
-      setError(errorMessage);
-      await cleanupRecording();
+      setError('Failed to stop recording');
     }
   };
 
-  // Add cleanup of invalid messages periodically
-  useEffect(() => {
-    const cleanup = () => {
-      setMessages(prev => prev.filter(validateMessage));
-    };
+  // Add portal rendering logic
+  const renderModelTraining = () => {
+    const container = document.getElementById('model-training-container');
+    if (!container) return null;
 
-    // Run cleanup every minute
-    const interval = setInterval(cleanup, 60000);
-    return () => clearInterval(interval);
-  }, []);
+    return createPortal(
+      <div>
+        <div className="flex justify-between items-center">
+          <h3 className="text-lg font-semibold text-white">Model Training</h3>
+          <span className="text-sm text-gray-400">{messages.length} samples</span>
+        </div>
+        <p className="text-gray-400 text-sm mt-2">
+          {messages.length < 5
+            ? `Need ${5 - messages.length} more recording${messages.length === 4 ? '' : 's'} to train`
+            : 'Ready for next training cycle'}
+        </p>
+      </div>,
+      container
+    );
+  };
 
-  return (
-    <div className="flex flex-col h-[600px] card">
-      <div className="flex-1 overflow-y-auto p-4 space-y-4">
-        {/* Recording status and transcription */}
-        {audioState.isRecording && (
-          <div className="space-y-4">
-            {/* Essential Recording Info */}
-            <div className="bg-gray-50 p-4 rounded-lg shadow-sm">
-              <div className="flex items-center justify-between mb-2">
-                <div className="flex items-center space-x-2">
-                  <div className="w-2 h-2 bg-red-500 rounded-full animate-pulse" />
-                  <span className="text-sm text-gray-600">
-                    {Math.ceil(audioState.timeRemaining)}s remaining
-                  </span>
+  const renderConversationInsights = () => {
+    const container = document.getElementById('conversation-insights-container');
+    if (!container) return null;
+
+    return createPortal(
+      <div>
+        <h3 className="text-lg font-semibold text-white mb-3">Conversation Insights</h3>
+        {messages.length > 0 ? (
+          <div className="space-y-3">
+            {/* Average Metrics */}
+            <div className="grid grid-cols-3 gap-3">
+              <div className="bg-gray-700/50 rounded-lg p-2">
+                <div className="text-sm text-gray-400">Avg. Stress</div>
+                <div className="text-lg font-bold text-blue-400">
+                  {Math.round(messages.reduce((acc, msg) => acc + msg.emotionalState.stress, 0) / messages.length)}%
                 </div>
               </div>
-
-              {/* Microphone Level - Essential for user feedback */}
-              <div className="h-2 bg-gray-200 rounded-full overflow-hidden">
-                <div
-                  className={`h-full transition-all duration-100 ${
-                    audioState.audioLevel < 5 ? 'bg-red-500' :
-                    audioState.audioLevel < 15 ? 'bg-yellow-500' :
-                    audioState.audioLevel > 85 ? 'bg-yellow-500' :
-                    'bg-green-500'
-                  }`}
-                  style={{ width: `${audioState.audioLevel}%` }}
-                />
+              <div className="bg-gray-700/50 rounded-lg p-2">
+                <div className="text-sm text-gray-400">Avg. Clarity</div>
+                <div className="text-lg font-bold text-green-400">
+                  {Math.round(messages.reduce((acc, msg) => acc + msg.emotionalState.clarity, 0) / messages.length)}%
+                </div>
               </div>
-              <div className="flex justify-between mt-1 text-xs text-gray-400">
-                <span>Too Low</span>
-                <span>Good</span>
-                <span>Too High</span>
+              <div className="bg-gray-700/50 rounded-lg p-2">
+                <div className="text-sm text-gray-400">Avg. Engagement</div>
+                <div className="text-lg font-bold text-purple-400">
+                  {Math.round(messages.reduce((acc, msg) => acc + msg.emotionalState.engagement, 0) / messages.length)}%
+                </div>
               </div>
             </div>
 
-            {/* Transcription Display */}
-            <div className="bg-gray-50 p-4 rounded-lg shadow-sm">
-              <p className="text-gray-600 italic min-h-[3em]">
-                {audioState.transcription || 'Listening...'}
+            {/* Recent Trends */}
+            {messages.length > 1 && (
+              <div className="bg-gray-700/50 rounded-lg p-2">
+                <h4 className="text-sm font-semibold text-white mb-1">Recent Trends</h4>
+                <ul className="text-sm">
+                  <li className="text-blue-400">
+                    Stress: {
+                      messages[messages.length - 1].emotionalState.stress > 
+                      messages[messages.length - 2].emotionalState.stress
+                      ? '↑ Increasing'
+                      : '↓ Decreasing'
+                    }
+                  </li>
+                  <li className="text-green-400">
+                    Clarity: {
+                      messages[messages.length - 1].emotionalState.clarity > 
+                      messages[messages.length - 2].emotionalState.clarity
+                      ? '↑ Improving'
+                      : '↓ Declining'
+                    }
+                  </li>
+                  <li className="text-purple-400">
+                    Engagement: {
+                      messages[messages.length - 1].emotionalState.engagement > 
+                      messages[messages.length - 2].emotionalState.engagement
+                      ? '↑ Increasing'
+                      : '↓ Decreasing'
+                    }
+                  </li>
+                </ul>
+              </div>
+            )}
+
+            {/* Session Summary */}
+            <div className="bg-gray-700/50 rounded-lg p-2">
+              <p className="text-sm text-gray-300">
+                {messages.length} recordings • {
+                  Math.round(messages.reduce((acc, msg) => acc + msg.duration, 0))
+                }s total
               </p>
             </div>
+          </div>
+        ) : (
+          <div className="text-center py-4">
+            <p className="text-gray-400 text-sm italic">
+              No insights yet. Record a message to see insights here!
+            </p>
+          </div>
+        )}
+      </div>,
+      container
+    );
+  };
 
-            {/* Emotion Analysis with LLM Feedback */}
-            <div className="bg-gray-50 p-4 rounded-lg shadow-sm">
-              <div className="space-y-4">
-                {/* Emotion Metrics */}
-                <div className="grid grid-cols-3 gap-4">
-                  <div className="text-center">
-                    <div className="text-sm text-gray-600 mb-1">Stress</div>
-                    <div className="text-lg font-medium text-gray-700">
-                      {currentEmotionalState.stress}%
-                    </div>
-                  </div>
-                  <div className="text-center">
-                    <div className="text-sm text-gray-600 mb-1">Clarity</div>
-                    <div className="text-lg font-medium text-gray-700">
-                      {currentEmotionalState.clarity}%
-                    </div>
-                  </div>
-                  <div className="text-center">
-                    <div className="text-sm text-gray-600 mb-1">Engagement</div>
-                    <div className="text-lg font-medium text-gray-700">
-                      {currentEmotionalState.engagement}%
-                    </div>
-                  </div>
-                </div>
+  const setupAudioRecording = async (): Promise<boolean> => {
+    try {
+      // First check if browser supports required APIs
+      if (!navigator.mediaDevices || !window.MediaRecorder) {
+        throw new Error('Your browser does not support audio recording');
+      }
 
-                {/* LLM Analysis */}
-                <div className="mt-4 pt-4 border-t border-gray-200">
-                  <div className="text-sm font-medium text-gray-700 mb-2">
-                    Communication Analysis
-                  </div>
-                  <p className="text-sm text-gray-600 mb-3">
-                    {audioState.emotionalFeedback?.analysis || "Waiting for speech..."}
-                  </p>
-                  {(audioState.emotionalFeedback?.suggestions && 
-                    (audioState.emotionalFeedback.suggestions.length > 0 || audioState.transcription)) && (
-                    <div>
-                      <div className="text-sm font-medium text-gray-700 mb-2">
-                        Suggestions for Improvement
-                      </div>
-                      <ul className="list-disc list-inside text-sm text-gray-600 space-y-1">
-                        {audioState.emotionalFeedback?.suggestions?.map((suggestion, index) => (
-                          <li key={index}>{suggestion}</li>
-                        )) || ["Continue speaking naturally"]}
-                      </ul>
-                    </div>
-                  )}
-                  {audioState.emotionalFeedback && (
-                    <div className="mt-2 text-xs text-gray-500">
-                      Analysis Confidence: {audioState.emotionalFeedback.confidence}%
-                    </div>
-                  )}
-                </div>
-              </div>
+      // Clean up any existing recording session
+      await cleanupRecording();
+
+      // Request audio permissions explicitly with optimal settings
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: {
+          echoCancellation: true,
+          noiseSuppression: true,
+          autoGainControl: true,
+          channelCount: 1,
+          sampleRate: 44100,
+          sampleSize: 16
+        },
+        video: false
+      });
+
+      // Initialize audio context with high-quality settings
+      const AudioContext = window.AudioContext || window.webkitAudioContext;
+      audioContextRef.current = new AudioContext({
+        latencyHint: 'interactive',
+        sampleRate: 44100
+      });
+      
+      // Create analyzer node with higher precision
+      const analyzerNode = audioContextRef.current.createAnalyser();
+      analyzerNode.fftSize = 2048;
+      analyzerNode.smoothingTimeConstant = 0.8;
+      
+      // Create gain node for volume control
+      const gainNode = audioContextRef.current.createGain();
+      gainNode.gain.value = 1.0;
+      
+      // Connect stream to analyzer through gain node
+      const source = audioContextRef.current.createMediaStreamSource(stream);
+      source.connect(gainNode);
+      gainNode.connect(analyzerNode);
+      analyzerNodeRef.current = analyzerNode;
+      
+      // Store stream reference
+      streamRef.current = stream;
+
+      // Initialize media recorder with optimal settings
+      const mimeType = getSupportedAudioMimeType();
+      if (!mimeType) {
+        throw new Error('No supported audio MIME type found');
+      }
+
+      const recorder = new MediaRecorder(stream, {
+        mimeType,
+        audioBitsPerSecond: 128000
+      });
+
+      mediaRecorderRef.current = recorder;
+      
+      // Initialize emotion service if not already done
+      if (!emotionService) {
+        const service = await EmotionAnalysisService.getInstance();
+        setEmotionService(service);
+      }
+
+      // Setup recorder event handlers with improved error handling
+      setupMediaRecorder(recorder);
+
+      // Start duration timer with more precise timing
+      if (durationIntervalRef.current) {
+        clearInterval(durationIntervalRef.current);
+      }
+      
+      durationIntervalRef.current = setInterval(() => {
+        setAudioState(prev => {
+          const newTimeRemaining = prev.timeRemaining - 1;
+          const newDuration = prev.duration + 1;
+          
+          if (newTimeRemaining <= 0) {
+            stopRecording();
+            return prev;
+          }
+          
+          return {
+            ...prev,
+            timeRemaining: newTimeRemaining,
+            duration: newDuration
+          };
+        });
+      }, 1000);
+
+      return true;
+    } catch (error) {
+      console.error('Error setting up audio recording:', error);
+      const errorMessage = error instanceof Error ? error.message : 'Failed to setup audio recording';
+      setError(errorMessage);
+      await cleanupRecording();
+      return false;
+    }
+  };
+
+  // Add cleanup function for audio resources
+  const cleanupAudioResources = useCallback(() => {
+    if (mediaRecorderRef.current) {
+      if (mediaRecorderRef.current.state !== 'inactive') {
+        mediaRecorderRef.current.stop();
+      }
+      mediaRecorderRef.current.stream.getTracks().forEach(track => track.stop());
+      mediaRecorderRef.current = null;
+    }
+    if (audioContextRef.current) {
+      audioContextRef.current.close();
+      audioContextRef.current = null;
+    }
+    if (analyzerNodeRef.current) {
+      analyzerNodeRef.current.disconnect();
+      analyzerNodeRef.current = null;
+    }
+    if (streamRef.current) {
+      streamRef.current.getTracks().forEach(track => track.stop());
+      streamRef.current = null;
+    }
+  }, []);
+
+  // Cleanup on unmount
+  useEffect(() => {
+    return () => {
+      cleanupAudioResources();
+      if (audioState.currentlyPlayingId) {
+        const audio = document.getElementById(audioState.currentlyPlayingId) as HTMLAudioElement;
+        if (audio) {
+          audio.pause();
+          audio.currentTime = 0;
+        }
+      }
+    };
+  }, [cleanupAudioResources, audioState.currentlyPlayingId]);
+
+  // Add real-time analysis component
+  const RealTimeAnalysis: React.FC<{ feedback?: EmotionalFeedback }> = ({ feedback }) => {
+    if (!feedback) return null;
+
+    return (
+      <div className="bg-gray-800 rounded-lg p-4 mt-4">
+        <h3 className="text-lg font-semibold text-white mb-2">Real-time Analysis</h3>
+        <div className="space-y-4">
+          <div>
+            <p className="text-gray-300">{feedback.analysis}</p>
+          </div>
+          <div>
+            <h4 className="text-sm font-medium text-gray-400 mb-2">Suggestions:</h4>
+            <ul className="list-disc list-inside space-y-1">
+              {feedback.suggestions.map((suggestion, index) => (
+                <li key={index} className="text-gray-300 text-sm">{suggestion}</li>
+              ))}
+            </ul>
+          </div>
+          <div className="flex items-center mt-2">
+            <div className="h-2 flex-grow bg-gray-700 rounded-full overflow-hidden">
+              <div
+                className="h-full bg-blue-500 transition-all duration-300"
+                style={{ width: `${feedback.confidence}%` }}
+              />
             </div>
+            <span className="ml-2 text-sm text-gray-400">
+              {Math.round(feedback.confidence)}% confidence
+            </span>
           </div>
-        )}
+        </div>
+      </div>
+    );
+  };
 
-        {messages.map((message) => (
-          <div key={message.id} className="flex items-center space-x-4">
-            <button
-              onClick={() => playMessage(message)}
-              className={`btn-secondary flex items-center space-x-2 ${
-                audioState.isPlaying ? 'opacity-50 cursor-not-allowed' : ''
-              }`}
-              disabled={audioState.isPlaying || audioState.isRecording}
-            >
-              <span>
-                {audioState.isPlaying ? 'Playing...' : 'Play Message'}
-              </span>
-              {audioState.isPlaying && (
-                <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin" />
-              )}
-            </button>
-            <span className="text-sm text-gray-600">
-              Duration: {Math.max(0, Math.round(message.duration))}s
-            </span>
-            <span className="text-xs text-gray-500">
-              {new Date(message.timestamp).toLocaleTimeString()}
-            </span>
-          </div>
-        ))}
-        {messages.length === 0 && (
-          <div className="text-center text-gray-500 py-8">
-            {audioState.isRecording ? 
-              'Recording in progress...' : 
-              'No messages yet. Start recording to add messages.'}
-          </div>
-        )}
+  return (
+    <div className="flex flex-col h-full">
+      <div className="flex justify-between items-center mb-4">
+        <h2 className="text-2xl font-bold text-white">Audio Communication</h2>
+        <TaraEmotionIndicator 
+          showTimeline={false}
+          className="mr-4"
+        />
       </div>
 
-      {/* Simplified Footer */}
-      <div className="border-t p-4 bg-gray-50">
-        <div className="flex justify-center">
-          <button
-            onClick={audioState.isRecording ? stopRecording : startRecording}
-            className={`btn-primary flex items-center space-x-2 ${
-              audioState.isRecording ? 'bg-red-600 hover:bg-red-700' : ''
-            }`}
-            disabled={!isModelReady || isAnalyzing}
-          >
-            <span>
-              {audioState.isRecording ? 'Stop Recording' : 'Start Recording'}
-            </span>
-          </button>
+      <div className="bg-gray-800/50 rounded-lg p-4">
+        <div className="mb-4">
+          <h2 className="text-xl font-semibold text-white mb-2">Record and analyze your speech in real-time</h2>
+          {error && (
+            <div className="mt-2 text-red-400 text-sm bg-red-900/20 p-2 rounded">{error}</div>
+          )}
         </div>
-        {error && (
-          <p className="text-red-500 text-sm text-center mt-2">{error}</p>
-        )}
+
+        <div className="space-y-6">
+          <div className="bg-gray-800 rounded-lg p-6 shadow-lg">
+            <div className="flex items-center justify-between mb-4">
+              <div className="flex items-center space-x-4">
+                <button
+                  onClick={audioState.isRecording ? stopRecording : startRecording}
+                  className={`p-4 rounded-full transition-all duration-200 ${
+                    audioState.isRecording
+                      ? 'bg-red-500 hover:bg-red-600 animate-pulse'
+                      : 'bg-blue-500 hover:bg-blue-600'
+                  }`}
+                >
+                  {audioState.isRecording ? 'Stop Recording' : 'Start Recording'}
+                </button>
+                
+                {/* Recording Status */}
+                {audioState.isRecording && (
+                  <div className="text-gray-300">
+                    <span className="font-medium">Recording: </span>
+                    <span>{audioState.duration}s</span>
+                    <span className="mx-2">|</span>
+                    <span>Time remaining: {audioState.timeRemaining}s</span>
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Audio Visualization */}
+            <canvas
+              ref={canvasRef}
+              className="w-full h-32 bg-gray-900 rounded-lg"
+              width={800}
+              height={128}
+            />
+
+            {/* Transcription */}
+            {audioState.transcription && (
+              <div className="mt-4">
+                <h3 className="text-lg font-semibold text-white mb-2">Transcription</h3>
+                <p className="text-gray-300 italic">{audioState.transcription}</p>
+              </div>
+            )}
+
+            {/* Real-time Analysis */}
+            <RealTimeAnalysis feedback={audioState.emotionalFeedback} />
+          </div>
+        </div>
       </div>
     </div>
   );
-} 
+};
+
+export default AudioChat;

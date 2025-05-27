@@ -1,13 +1,20 @@
+'use client';
+
 import { useState, useEffect } from 'react';
 import { useDispatch, useSelector } from 'react-redux';
 import { RootState } from '@/store';
-import { updateEmotionalState, EmotionalState } from '@/store/slices/communicationSlice';
+import { updateEmotionalState } from '@/store/slices/communicationSlice';
+import { EmotionalState } from '@/types/emotions';
 import { EmotionAnalysisService } from '@/services/emotionAnalysis';
 
 export default function DebugPanel() {
   const dispatch = useDispatch();
   const { mode, emotionalStates, history } = useSelector((state: RootState) => state.communication);
-  const currentEmotionalState = emotionalStates[mode];
+  const currentEmotionalState = emotionalStates[mode]?.emotionalState || {
+    stress: 50,
+    clarity: 50,
+    engagement: 50
+  };
   const [emotionService, setEmotionService] = useState<EmotionAnalysisService | null>(null);
   
   // Track latest analyzed emotion from history

@@ -15,4 +15,18 @@ export interface EmotionalSuggestion {
   context: string;
   emotionalState: EmotionalState;
   timestamp: number;
+}
+
+export interface EmotionalFeedback {
+  state: EmotionalState;
+  analysis: string;
+  suggestions: string[];
+  confidence: number;
+}
+
+export interface AnalysisResult {
+  state: EmotionalState;
+  analysis?: string;
+  suggestions?: string[];
+  confidence?: number;
 } 
