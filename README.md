@@ -156,12 +156,12 @@ graph LR
 ### Unified Component Flow
 ```mermaid
 graph TD
-    User -->|Input| Chat{Text/Audio/VideoChat}
-    Chat -->|Process| Service[Analysis Services]
-    Service -->|AI| TensorFlow.js
-    Service -->|Store| Redux[conversationSlice]
-    Redux -->|Update| Viz[EmotionAnalysisVisualizer]
-    Viz --> User
+    User[User Input] --> Interface{Communication Interface}
+    Interface --> Processing[Data Processing]
+    Processing --> AI[Local AI Analysis]
+    AI --> Storage[State Management]
+    Storage --> Feedback[Real-time Feedback]
+    Feedback --> User
 ```
 
 ### Detailed Interaction Flow
