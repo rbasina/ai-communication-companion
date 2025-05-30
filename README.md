@@ -58,6 +58,42 @@ Empowering better communication through real-time emotional intelligence, while 
 
 ## Project Flow
 
+### Real-Time Processing Animation
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant UI
+    participant AI
+    participant Storage
+    
+    loop Text Analysis
+        User->>UI: Types message
+        UI->>AI: Analyze emotion
+        AI->>Storage: Save results
+        Storage->>UI: Update display
+    end
+    
+    loop Audio Processing
+        User->>UI: Speaks
+        UI->>AI: Analyze tone
+        AI->>Storage: Save metrics
+        Storage->>UI: Show feedback
+    end
+    
+    loop Video Analysis
+        User->>UI: Video feed
+        UI->>AI: Analyze expressions
+        AI->>Storage: Save data
+        Storage->>UI: Display insights
+    end
+```
+
+### Processing Flow Visualization
+🔄 `User Input` → 🎤 `Audio` → 🧠 `AI Analysis` → 💡 `Insights`  
+🔄 `User Input` → 📝 `Text` → 🧠 `AI Analysis` → 💡 `Insights`  
+🔄 `User Input` → 🎥 `Video` → 🧠 `AI Analysis` → 💡 `Insights`
+
 ### Communication-Type Specific Architectures
 
 #### Text Communication Flow
