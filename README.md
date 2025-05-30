@@ -107,6 +107,60 @@ graph TB
 ```
 **Description**: Focuses on local data processing and storage, with optional cloud sync controlled by the user. Ideal for privacy-sensitive applications.
 
+#### Option 4: Component-Level Flow
+```mermaid
+graph LR
+    subgraph UI Components
+        TextChat
+        AudioChat
+        VideoChat
+        EmotionAnalysisVisualizer
+    end
+
+    subgraph Services
+        TextAnalysisService
+        AudioAnalysisService
+        VideoAnalysisService
+        WebRTCService
+    end
+
+    subgraph Data & Processing
+        ConversationSlice[conversationSlice]
+        TensorFlowJS[TensorFlow.js]
+        AudioProcessor
+        VideoProcessor
+    end
+
+    TextChat -->|Text Input| ConversationSlice
+    TextChat -->|Send for Analysis| TextAnalysisService
+    AudioChat -->|Audio Stream| WebRTCService
+    AudioChat -->|Send for Analysis| AudioAnalysisService
+    AudioChat --> AudioProcessor
+    VideoChat -->|Video Stream| WebRTCService
+    VideoChat -->|Send for Analysis| VideoAnalysisService
+    VideoChat --> VideoProcessor
+
+    ConversationSlice -->|State| EmotionAnalysisVisualizer
+    TextAnalysisService -->|Results| ConversationSlice
+    AudioAnalysisService -->|Results| ConversationSlice
+    VideoAnalysisService -->|Results| ConversationSlice
+
+    TextAnalysisService --> TensorFlowJS
+    AudioAnalysisService --> TensorFlowJS
+    VideoAnalysisService --> TensorFlowJS
+
+    AudioProcessor --> TensorFlowJS
+    VideoProcessor --> TensorFlowJS
+    WebRTCService --> AudioProcessor
+    WebRTCService --> VideoProcessor
+
+    ConversationSlice --> TextChat
+    ConversationSlice --> AudioChat
+    ConversationSlice --> VideoChat
+
+```
+**Description**: This diagram illustrates the direct interactions and data flow between specific components, services, and data layers within the application, aligning with the detailed interaction flows.
+
 ### Detailed Interaction Flow
 
 #### Text Interface
@@ -147,11 +201,3 @@ Users interact with the application through its frontend interface.
 4.  The application provides real-time feedback and suggestions to the user based on the analysis.
 5.  Optionally, conversations can be summarized, and action items are generated, stored locally, and accessible via the UI.
 6.  User settings control privacy preferences and data sharing options.
-
-## Contributing
-
-Please read [CONTRIBUTING.md](CONTRIBUTING.md) for details on our code of conduct and the process for submitting pull requests.
-
-## License
-
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details. 
