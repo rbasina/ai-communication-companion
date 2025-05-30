@@ -58,108 +58,75 @@ Empowering better communication through real-time emotional intelligence, while 
 
 ## Project Flow
 
-### Architecture and Data Flow
+### Communication-Type Specific Architectures
 
-#### Option 1: Basic Component Flow
+#### Text Communication Flow
+```mermaid
+graph LR
+    A[User] -->|Text Input| B[TextChat.tsx]
+    B -->|storeText| C[conversationSlice.ts]
+    B -->|analyze| D[TextAnalysisService.ts]
+    D -->|process| E[TensorFlow.js]
+    E -->|results| D
+    D -->|update| C
+    C -->|render| F[EmotionAnalysisVisualizer.tsx]
+    F --> A
+```
+
+**Key Components**:
+- `src/components/TextChat.tsx`: Text input interface
+- `src/services/TextAnalysisService.ts`: Text processing service
+- `src/store/slices/conversationSlice.ts`: Redux storage
+- `src/components/EmotionAnalysisVisualizer.tsx`: Visualization component
+
+#### Audio Communication Flow
+```mermaid
+graph LR
+    A[User] -->|Microphone| B[AudioChat.tsx]
+    B -->|stream| C[WebRTCService.ts]
+    B -->|chunk| D[audioProcessor.ts]
+    D -->|analyze| E[TensorFlow.js]
+    E -->|tone| D
+    D -->|update| F[conversationSlice.ts]
+    F -->|render| G[EmotionAnalysisVisualizer.tsx]
+    G --> A
+```
+
+**Key Components**:
+- `src/components/AudioChat.tsx`: Audio interface
+- `src/services/WebRTCService.ts`: Real-time communication
+- `src/scripts/audioProcessor.ts`: Audio processing scripts
+- `src/services/AudioAnalysisService.ts`: Audio analysis service
+
+#### Video Communication Flow
+```mermaid
+graph LR
+    A[User] -->|Camera| B[VideoChat.tsx]
+    B -->|stream| C[WebRTCService.ts]
+    B -->|frame| D[videoProcessor.ts]
+    D -->|analyze| E[TensorFlow.js]
+    E -->|expressions| D
+    D -->|update| F[conversationSlice.ts]
+    F -->|render| G[EmotionAnalysisVisualizer.tsx]
+    G --> A
+```
+
+**Key Components**:
+- `src/components/VideoChat.tsx`: Video interface
+- `src/scripts/videoProcessor.ts`: Frame processing
+- `src/services/VideoAnalysisService.ts`: Video analysis
+- Shared `conversationSlice.ts` for state management
+
+### Unified Component Flow
 ```mermaid
 graph TD
-    A[User Interface] -->|Input/Events| B[Components]
-    B -->|State Updates| C[Redux Store]
-    C -->|State| B
-    B -->|API Calls| D[Services]
-    D -->|AI Processing| E[TensorFlow.js]
-    E -->|Analysis Results| D
-    D -->|Response| B
-    B -->|Real-time Data| F[WebRTC]
-    F -->|Streams| B
-    B -->|Render| A
+    User -->|Input| Chat{Text/Audio/VideoChat}
+    Chat -->|Process| Service[Analysis Services]
+    Service -->|AI| TensorFlow.js
+    Service -->|Store| Redux[conversationSlice]
+    Redux -->|Update| Viz[EmotionAnalysisVisualizer]
+    Viz --> User
 ```
-**Description**: This flow shows the core interaction between UI components, state management, and services. User inputs trigger state updates, API calls, and real-time data processing, with results rendered back to the UI.
-
-#### Option 2: Detailed Data Flow
-```mermaid
-graph LR
-    A[User] -->|Text/Audio/Video| B[UI Components]
-    B -->|Events| C[Redux Actions]
-    C -->|Dispatch| D[Redux Store]
-    D -->|State| B
-    B -->|API Requests| E[Services Layer]
-    E -->|AI Analysis| F[TensorFlow.js]
-    F -->|Results| E
-    E -->|Data| B
-    B -->|Real-time| G[WebRTC Module]
-    G -->|Streams| B
-    B -->|Feedback| A
-```
-**Description**: A linear flow highlighting how user data (text, audio, video) moves through the system. It emphasizes the role of Redux for state management and WebRTC for real-time communication.
-
-#### Option 3: Privacy-Focused Flow
-```mermaid
-graph TB
-    A[User] -->|Local Data| B[Components]
-    B -->|Process Locally| C[TensorFlow.js]
-    C -->|Analysis| B
-    B -->|Store Locally| D[Redux Store]
-    D -->|Retrieve| B
-    B -->|Optional Sync| E[Backend API]
-    E -->|User-Controlled| F[Cloud/DB]
-    B -->|Render| A
-```
-**Description**: Focuses on local data processing and storage, with optional cloud sync controlled by the user. Ideal for privacy-sensitive applications.
-
-#### Option 4: Component-Level Flow
-```mermaid
-graph LR
-    subgraph UI Components
-        TextChat
-        AudioChat
-        VideoChat
-        EmotionAnalysisVisualizer
-    end
-
-    subgraph Services
-        TextAnalysisService
-        AudioAnalysisService
-        VideoAnalysisService
-        WebRTCService
-    end
-
-    subgraph Data & Processing
-        ConversationSlice[conversationSlice]
-        TensorFlowJS[TensorFlow.js]
-        AudioProcessor
-        VideoProcessor
-    end
-
-    TextChat -->|Text Input| ConversationSlice
-    TextChat -->|Send for Analysis| TextAnalysisService
-    AudioChat -->|Audio Stream| WebRTCService
-    AudioChat -->|Send for Analysis| AudioAnalysisService
-    AudioChat --> AudioProcessor
-    VideoChat -->|Video Stream| WebRTCService
-    VideoChat -->|Send for Analysis| VideoAnalysisService
-    VideoChat --> VideoProcessor
-
-    ConversationSlice -->|State| EmotionAnalysisVisualizer
-    TextAnalysisService -->|Results| ConversationSlice
-    AudioAnalysisService -->|Results| ConversationSlice
-    VideoAnalysisService -->|Results| ConversationSlice
-
-    TextAnalysisService --> TensorFlowJS
-    AudioAnalysisService --> TensorFlowJS
-    VideoAnalysisService --> TensorFlowJS
-
-    AudioProcessor --> TensorFlowJS
-    VideoProcessor --> TensorFlowJS
-    WebRTCService --> AudioProcessor
-    WebRTCService --> VideoProcessor
-
-    ConversationSlice --> TextChat
-    ConversationSlice --> AudioChat
-    ConversationSlice --> VideoChat
-
-```
-**Description**: This diagram illustrates the direct interactions and data flow between specific components, services, and data layers within the application, aligning with the detailed interaction flows.
 
 ### Detailed Interaction Flow
 
